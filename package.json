@@ -1,0 +1,37 @@
+{
+  "name": "directtalk",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "dev": "vite",
+    "signal": "node server/index.mjs",
+    "test:signal": "node scripts/check-signal.mjs",
+    "check:server": "node --check server/signaling.mjs && node --check server/index.mjs && node --check api/signal.mjs",
+    "build": "tsc -b && vite build",
+    "test": "vitest run",
+    "check": "npm run test && npm run check:server && npm run build"
+  },
+  "dependencies": {
+    "dexie": "^4.2.0",
+    "ioredis": "^5.11.1",
+    "qrcode": "^1.5.4",
+    "react": "^19.1.1",
+    "react-dom": "^19.1.1",
+    "ws": "^8.18.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.18.0",
+    "@types/qrcode": "^1.5.5",
+    "@types/react": "^19.1.12",
+    "@types/react-dom": "^19.1.9",
+    "@types/ws": "^8.18.1",
+    "@vitejs/plugin-react": "^5.0.2",
+    "typescript": "^5.9.2",
+    "vite": "^7.1.4",
+    "vitest": "^3.2.4"
+  }
+}
