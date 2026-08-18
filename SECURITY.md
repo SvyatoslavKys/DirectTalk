@@ -2,7 +2,7 @@
 
 ## Status
 
-Version `0.1.0` is a security-oriented MVP that has not undergone an independent audit. It uses standard Web Crypto primitives, but their composition is the DirectTalk protocol and requires external review before production use.
+The current `0.x` release is a security-oriented MVP that has not undergone an independent audit. It uses standard Web Crypto primitives, but their composition is the DirectTalk protocol and requires external review before production use.
 
 ## Threat model
 

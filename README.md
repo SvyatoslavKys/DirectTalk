@@ -103,6 +103,10 @@ See `.env.example` for an example configuration.
 
 Never place a long-lived TURN secret in a `VITE_*` variable: everything with that prefix is included in the client-side JavaScript. A production service should issue short-lived TURN credentials to the browser from a server-side endpoint.
 
+## Versioning
+
+`package.json` is the single source of the application version. Vite injects it into the footer and Diagnostics at build time. Every deployable code change must bump the version: patch for a compatible fix, minor for a new feature, and major for an incompatible application change. The WebRTC protocol version is tracked separately and must change only together with a compatibility and migration plan.
+
 ## Project structure
 
 ```text

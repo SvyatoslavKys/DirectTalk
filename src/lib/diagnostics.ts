@@ -1,3 +1,5 @@
+import { APP_VERSION } from "./version";
+
 export type DiagnosticLevel = "info" | "warn" | "error";
 
 export interface DiagnosticEntry {
@@ -24,7 +26,7 @@ export function initializeDiagnostics(): () => void {
   initialized = true;
 
   logDiagnostic("app", "started", {
-    version: "0.1.0",
+    version: APP_VERSION,
     secureContext: window.isSecureContext,
     online: navigator.onLine,
     visibility: document.visibilityState,
@@ -99,9 +101,10 @@ export function clearDiagnostics(): void {
 export function formatDiagnosticReport(): string {
   const connection = navigatorConnection();
   const header = [
-    "DirectTalk diagnostics v1",
+    "DirectTalk diagnostics",
+    "format=1",
     `generated=${new Date().toISOString()}`,
-    `app=0.1.0`,
+    `app=${APP_VERSION}`,
     `origin=${window.location.origin}`,
     `path=${window.location.pathname}`,
     `browser=${safeErrorText(navigator.userAgent, 260)}`,

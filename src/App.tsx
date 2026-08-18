@@ -57,6 +57,7 @@ import {
   safeErrorText,
   subscribeDiagnostics,
 } from "./lib/diagnostics";
+import { APP_VERSION } from "./lib/version";
 
 type Screen = "loading" | "home" | "waiting" | "chat" | "error";
 type ThemeId = "lime" | "aqua" | "midnight";
@@ -1557,7 +1558,7 @@ export default function App() {
 
         {showDiagnostics && <DiagnosticsPanel language={language} onClose={() => setShowDiagnostics(false)} />}
 
-        <footer className="page-footer"><span>DirectTalk 0.1</span><span>{t("footer.history")}</span></footer>
+        <footer className="page-footer"><span>DirectTalk {APP_VERSION}</span><span>{t("footer.history")}</span></footer>
       </main>
     </>
   );
