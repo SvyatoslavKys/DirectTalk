@@ -8,6 +8,9 @@
   "functions": {
     "api/signal.mjs": {
       "maxDuration": 300
+    },
+    "api/turn.mjs": {
+      "maxDuration": 10
     }
   },
   "headers": [

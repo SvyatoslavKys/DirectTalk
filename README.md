@@ -8,7 +8,7 @@ A minimal private chat between two browsers. The signaling server only relays SD
 
 - one-time invitations via a link or locally generated QR code;
 - explicit connection confirmation before revealing an IP address to the peer;
-- a direct WebRTC DataChannel, with the option to add TURN as a fallback;
+- a direct WebRTC DataChannel with Cloudflare TURN relay fallback for restrictive NATs and mobile networks;
 - additional end-to-end encryption on top of DTLS without trusting the signaling server;
 - a persistent local device key and signed ephemeral session keys;
 - a safety code and persistent verified-contact status;
@@ -26,9 +26,10 @@ DirectTalk deploys as one Vercel project:
 
 - Vite builds the React frontend and Vercel serves it over HTTPS;
 - `api/signal.mjs` exposes the same-origin WebSocket endpoint at `/api/signal`;
+- `api/turn.mjs` obtains short-lived Cloudflare TURN credentials without exposing the long-lived TURN key to the browser;
 - the signaling backend relays only SDP and ICE while the connection is being established;
 - once the encrypted DataChannel handshake succeeds, both browsers close their signaling WebSockets and continue peer to peer;
-- Redis Cloud coordinates signaling sockets that land on different Vercel Function instances. It contains only short-lived room-role leases and transient Pub/Sub events, never messages, photos, names, or encryption keys.
+- Redis Cloud coordinates signaling sockets that land on different Vercel Function instances and rate-limits TURN credential requests using a keyed hash of the client address. It never stores messages, photos, names, encryption keys, raw IP addresses, or TURN secrets.
 
 Vercel WebSocket Functions have a maximum lifetime. Before WebRTC is ready, the browser reconnects to signaling automatically. After WebRTC is ready, signaling is no longer needed.
 
@@ -37,9 +38,11 @@ Vercel WebSocket Functions have a maximum lifetime. Before WebRTC is ready, the 
 1. Push this directory to a GitHub repository.
 2. In Vercel, create a project and import that repository. Vercel reads `vercel.json`; no build-setting changes are required.
 3. In the Vercel Marketplace, add **Redis Cloud** to this project and make sure it creates a `REDIS_URL` environment variable for Production and Preview.
-4. Do not add `VITE_SIGNALING_URL` in Vercel. The browser automatically connects to `wss://<your-domain>/api/signal` on the same origin.
-5. Deploy, then open `https://<your-domain>/api/signal`. A configured deployment returns JSON with `"status":"ok"`, `"sharedBroker":true`, and `"storesMessages":false`.
-6. Open the app on two different devices. Create an invitation on the first device and open it on the second.
+4. Create a key in Cloudflare Realtime TURN. Add its ID to Vercel as `CLOUDFLARE_TURN_KEY_ID` and the key secret as the sensitive `CLOUDFLARE_TURN_API_TOKEN`. Enable both variables for Production and Preview. These are server-side variables: never add `VITE_` to their names.
+5. Optionally add a random server-side `TURN_RATE_LIMIT_SECRET`. The endpoint otherwise uses the TURN key secret as its HMAC key when storing an irreversible per-client rate-limit identifier in Redis.
+6. Do not add `VITE_SIGNALING_URL` in Vercel. The browser automatically connects to `wss://<your-domain>/api/signal` on the same origin.
+7. Redeploy after adding the variables, then open `https://<your-domain>/api/signal`. A configured deployment returns JSON with `"status":"ok"`, `"sharedBroker":true`, and `"storesMessages":false`.
+8. Open the app on two different devices. Create an invitation on the first device and open it on the second. In Diagnostics, a working relay configuration shows `turn credentials-ready`, `relayEnabled:true`, and normally at least one ICE entry with `"iceType":"relay"` on a network that requires TURN.
 
 Always test invitations on the stable production domain, not a temporary Vercel deployment URL. Set `VITE_PUBLIC_APP_URL` if the production domain is different from `https://direct-talk.vercel.app`.
 
@@ -47,7 +50,7 @@ Always test invitations on the stable production domain, not a temporary Vercel 
 
 The in-app **Diagnostics** button opens a mobile-friendly technical log. On a narrow screen it is shown as an `i` button in the top bar. The error screen also links directly to this panel.
 
-The report records connection stages, signaling and WebRTC state changes, DataChannel state, and the encrypted-handshake stage. Use **Share logs** on a phone or **Copy logs** on desktop. It intentionally excludes message text, files, cryptographic keys, invitation secrets, SDP, ICE candidates, and IP addresses. The log survives a normal reload in the same tab through `sessionStorage`, but a browser process crash may still remove it.
+The report records connection stages, signaling and WebRTC state changes, DataChannel state, and the encrypted-handshake stage. Use **Share logs** on a phone or **Copy logs** on desktop. It intentionally excludes message text, files, cryptographic keys, invitation secrets, SDP, ICE candidate values, and IP addresses. It records only the non-sensitive ICE route class (`host`, `srflx`, `prflx`, or `relay`). The log survives a normal reload in the same tab through `sessionStorage`, but a browser process crash may still remove it.
 
 To test the deployed signaling endpoint from a terminal:
 
@@ -57,7 +60,7 @@ SIGNAL_TEST_ORIGIN=https://your-domain.example \
 npm run test:signal
 ```
 
-WebSockets on Vercel are currently a Public Beta. For networks where a direct WebRTC path cannot be created, a production deployment still needs TURN with short-lived credentials.
+WebSockets on Vercel are currently a Public Beta. DirectTalk requests short-lived TURN credentials before creating the peer connection and falls back to STUN-only mode if the endpoint is not configured or temporarily unavailable. The fallback can still fail between restrictive networks, which is reported in Diagnostics.
 
 ## Local development
 
@@ -93,6 +96,10 @@ See `.env.example` for an example configuration.
 - `SIGNAL_HOST` — listening interface; defaults to `127.0.0.1` and is usually `0.0.0.0` inside a container.
 - `ALLOWED_ORIGINS` — comma-separated list of exact allowed origins.
 - `REDIS_URL` — Redis connection URL used only to coordinate Vercel Function instances; required on Vercel and optional for the single-process local server.
+- `CLOUDFLARE_TURN_KEY_ID` — server-side Cloudflare Realtime TURN key ID.
+- `CLOUDFLARE_TURN_API_TOKEN` — server-side secret returned with that TURN key; mark it sensitive in Vercel.
+- `TURN_CREDENTIAL_TTL_SECONDS` — optional short-lived credential lifetime; defaults to 21,600 seconds and is clamped to 10 minutes–12 hours.
+- `TURN_RATE_LIMIT_SECRET` — optional independent HMAC secret for privacy-preserving per-client TURN request rate limiting.
 
 Never place a long-lived TURN secret in a `VITE_*` variable: everything with that prefix is included in the client-side JavaScript. A production service should issue short-lived TURN credentials to the browser from a server-side endpoint.
 
@@ -108,6 +115,7 @@ src/lib/database.ts    device key, contacts, messages, and attachments
 server/signaling.mjs   signaling protocol and in-memory/Redis coordination
 server/index.mjs       local signaling-server entrypoint
 api/signal.mjs         Vercel WebSocket Function entrypoint
+api/turn.mjs           same-origin short-lived TURN credential endpoint
 vercel.json            Vercel build, Function, region, and security headers
 SECURITY.md            threat model and security limitations
 ```
@@ -117,7 +125,7 @@ SECURITY.md            threat model and security limitations
 - serve the client exclusively over HTTPS and signaling exclusively over WSS;
 - configure CSP and the other headers documented in `SECURITY.md` on the HTTP server instead of relying only on the meta tag;
 - allow only the production origin in `ALLOWED_ORIGINS`;
-- deploy your own STUN/TURN service, or use a provider that issues short-lived credentials;
+- configure Cloudflare Realtime TURN and verify that Diagnostics reports relay candidates on a restrictive-network test;
 - do not add analytics, third-party scripts, or HTML rendering for message content;
 - obtain an independent review of the protocol and implementation before making production-security claims;
 - add protocol versioning and migrations before onboarding real users.
@@ -125,7 +133,7 @@ SECURITY.md            threat model and security limitations
 ## Roadmap
 
 1. Automated end-to-end testing in two isolated browser contexts.
-2. A TURN credential endpoint and a `relay-only` mode that hides each participant's IP address from the other peer.
+2. An optional `relay-only` mode that hides each participant's IP address from the other peer.
 3. Optional local-history encryption using a key protected by a user passphrase.
 4. A PWA/offline shell and contact management.
 5. Voice messages and additional file types, each with dedicated limits and a security model.

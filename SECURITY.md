@@ -107,7 +107,8 @@ Production deployments should also:
 - limit the size and frequency of WebSocket messages;
 - use an exact origin allowlist;
 - use Redis only for short-lived signaling coordination and disable persistence/diagnostic logging where the provider allows it;
-- issue TURN credentials with a short time to live;
+- keep the long-lived Cloudflare TURN key exclusively in server-side environment variables and issue credentials with a short time to live;
+- protect the TURN credential endpoint with an exact same-origin check, no-store responses, strict response validation, and Redis-backed request rate limiting;
 - avoid third-party JavaScript, CDN-hosted fonts, analytics, and error trackers that could access application data;
 - publish reproducible builds and release hashes once a release process exists.
 

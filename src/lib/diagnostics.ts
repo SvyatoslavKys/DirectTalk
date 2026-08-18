@@ -112,7 +112,7 @@ export function formatDiagnosticReport(): string {
     `screen=${window.screen.width}x${window.screen.height}`,
     `viewport=${window.innerWidth}x${window.innerHeight}`,
     connection ? `network=${connection}` : "network=unavailable",
-    "privacy=message text, files, keys, invitation secrets, SDP, ICE candidates and IP addresses are not logged",
+    "privacy=message text, files, keys, invitation secrets, SDP, ICE candidate values and IP addresses are not logged; only ICE route type is recorded",
     "",
   ];
   const lines = entries.map((entry) => {

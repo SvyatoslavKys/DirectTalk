@@ -10,7 +10,7 @@
     "dev": "vite",
     "signal": "node server/index.mjs",
     "test:signal": "node scripts/check-signal.mjs",
-    "check:server": "node --check server/signaling.mjs && node --check server/index.mjs && node --check api/signal.mjs",
+    "check:server": "node --check server/signaling.mjs && node --check server/index.mjs && node --check api/signal.mjs && node --check api/turn.mjs",
     "build": "tsc -b && vite build",
     "test": "vitest run",
     "check": "npm run test && npm run check:server && npm run build"

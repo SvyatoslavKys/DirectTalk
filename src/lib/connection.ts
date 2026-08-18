@@ -100,13 +100,33 @@ export class DirectTalkConnection {
   private lastStage = "created";
   private localCandidateCount = 0;
   private remoteCandidateCount = 0;
+  private rtcConfig?: RTCConfiguration;
+  private startPromise?: Promise<void>;
 
   constructor(private readonly options: ConnectionOptions) {}
 
   connect(): void {
-    if (this.socket || this.closed || this.secureNotified) return;
+    if (this.socket || this.startPromise || this.closed || this.secureNotified) return;
     this.trace("connect", { role: this.options.role });
     this.options.onState("connecting-signaling");
+    const operation = this.startConnection();
+    this.startPromise = operation;
+    void operation
+      .catch((error: unknown) => this.fail(error, "rtc-configuration"))
+      .finally(() => {
+        if (this.startPromise === operation) this.startPromise = undefined;
+      });
+  }
+
+  private async startConnection(): Promise<void> {
+    this.rtcConfig = await rtcConfiguration();
+    if (this.closed) return;
+    const serverCount = this.rtcConfig.iceServers?.length ?? 0;
+    const relayEnabled = this.rtcConfig.iceServers?.some((server) => {
+      const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
+      return urls.some((url) => /^(?:turn|turns):/iu.test(url));
+    }) ?? false;
+    this.trace("rtc-configuration-ready", { serverCount, relayEnabled });
     if (!this.peerConnection) this.setupPeerConnection();
     this.openSignalingSocket();
   }
@@ -184,16 +204,20 @@ export class DirectTalkConnection {
   }
 
   private setupPeerConnection(): void {
+    if (!this.rtcConfig) throw new Error("WebRTC configuration is not ready");
     const generation = ++this.peerGeneration;
     this.trace("peer-created", { generation });
-    const peerConnection = new RTCPeerConnection(rtcConfiguration());
+    const peerConnection = new RTCPeerConnection(this.rtcConfig);
     this.peerConnection = peerConnection;
 
     peerConnection.addEventListener("icecandidate", (event) => {
       if (generation !== this.peerGeneration) return;
       if (event.candidate) {
         this.localCandidateCount += 1;
-        this.trace("local-ice-candidate", { count: this.localCandidateCount });
+        this.trace("local-ice-candidate", {
+          count: this.localCandidateCount,
+          iceType: iceCandidateType(event.candidate),
+        });
         this.sendSignal({ candidate: event.candidate.toJSON() });
       } else {
         this.trace("ice-gathering-complete", { count: this.localCandidateCount });
@@ -338,7 +362,11 @@ export class DirectTalkConnection {
     }
     const peerConnection = this.requirePeerConnection();
     this.remoteCandidateCount += 1;
-    this.trace("remote-ice-candidate", { count: this.remoteCandidateCount, queued: !peerConnection.remoteDescription });
+    this.trace("remote-ice-candidate", {
+      count: this.remoteCandidateCount,
+      queued: !peerConnection.remoteDescription,
+      iceType: iceCandidateInitType(candidate),
+    });
     if (!peerConnection.remoteDescription) this.pendingCandidates.push(candidate);
     else await peerConnection.addIceCandidate(candidate);
   }
@@ -629,4 +657,12 @@ function signalErrorText(code: unknown): string {
     default:
       return "Ошибка signaling-сервера";
   }
+}
+
+function iceCandidateType(candidate: RTCIceCandidate): string {
+  return candidate.type || iceCandidateInitType(candidate.toJSON());
+}
+
+function iceCandidateInitType(candidate: RTCIceCandidateInit): string {
+  return candidate.candidate?.match(/\styp\s(host|srflx|prflx|relay)(?:\s|$)/iu)?.[1]?.toLowerCase() ?? "unknown";
 }
