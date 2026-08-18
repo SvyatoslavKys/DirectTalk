@@ -28,7 +28,7 @@ DirectTalk deploys as one Vercel project:
 - `api/signal.mjs` exposes the same-origin WebSocket endpoint at `/api/signal`;
 - the signaling backend relays only SDP and ICE while the connection is being established;
 - once the encrypted DataChannel handshake succeeds, both browsers close their signaling WebSockets and continue peer to peer;
-- Upstash Redis coordinates signaling sockets that land on different Vercel Function instances. It contains only short-lived room-role leases and transient Pub/Sub events, never messages, photos, names, or encryption keys.
+- Redis Cloud coordinates signaling sockets that land on different Vercel Function instances. It contains only short-lived room-role leases and transient Pub/Sub events, never messages, photos, names, or encryption keys.
 
 Vercel WebSocket Functions have a maximum lifetime. Before WebRTC is ready, the browser reconnects to signaling automatically. After WebRTC is ready, signaling is no longer needed.
 
@@ -36,10 +36,18 @@ Vercel WebSocket Functions have a maximum lifetime. Before WebRTC is ready, the 
 
 1. Push this directory to a GitHub repository.
 2. In Vercel, create a project and import that repository. Vercel reads `vercel.json`; no build-setting changes are required.
-3. In the Vercel Marketplace, add **Upstash Redis** to this project and make sure it creates a `REDIS_URL` environment variable for Production and Preview.
+3. In the Vercel Marketplace, add **Redis Cloud** to this project and make sure it creates a `REDIS_URL` environment variable for Production and Preview.
 4. Do not add `VITE_SIGNALING_URL` in Vercel. The browser automatically connects to `wss://<your-domain>/api/signal` on the same origin.
 5. Deploy, then open `https://<your-domain>/api/signal`. A configured deployment returns JSON with `"status":"ok"`, `"sharedBroker":true`, and `"storesMessages":false`.
 6. Open the app on two different devices. Create an invitation on the first device and open it on the second.
+
+Always test invitations on the stable production domain, not a temporary Vercel deployment URL. Set `VITE_PUBLIC_APP_URL` if the production domain is different from `https://direct-talk.vercel.app`.
+
+## Connection diagnostics
+
+The in-app **Diagnostics** button opens a mobile-friendly technical log. On a narrow screen it is shown as an `i` button in the top bar. The error screen also links directly to this panel.
+
+The report records connection stages, signaling and WebRTC state changes, DataChannel state, and the encrypted-handshake stage. Use **Share logs** on a phone or **Copy logs** on desktop. It intentionally excludes message text, files, cryptographic keys, invitation secrets, SDP, ICE candidates, and IP addresses. The log survives a normal reload in the same tab through `sessionStorage`, but a browser process crash may still remove it.
 
 To test the deployed signaling endpoint from a terminal:
 
@@ -80,6 +88,7 @@ See `.env.example` for an example configuration.
 
 - `VITE_SIGNALING_URL` — WebSocket signaling URL; production deployments must use `wss://`.
 - `VITE_STUN_URL` — STUN URL; defaults to `stun:stun.cloudflare.com:3478`.
+- `VITE_PUBLIC_APP_URL` — stable public HTTPS origin used for invitation links; optional when deploying to `https://direct-talk.vercel.app`.
 - `SIGNAL_PORT` — signaling-server port; defaults to `8787`.
 - `SIGNAL_HOST` — listening interface; defaults to `127.0.0.1` and is usually `0.0.0.0` inside a container.
 - `ALLOWED_ORIGINS` — comma-separated list of exact allowed origins.
@@ -94,6 +103,7 @@ src/lib/protocol.ts    application handshake, HKDF, and AES-GCM
 src/lib/connection.ts  WebRTC, signaling, and the encrypted messaging protocol
 src/lib/photos.ts      image validation, chunking, and hashing
 src/lib/i18n.ts        translations, language detection, and runtime-error localization
+src/lib/diagnostics.ts privacy-safe in-browser connection diagnostics
 src/lib/database.ts    device key, contacts, messages, and attachments
 server/signaling.mjs   signaling protocol and in-memory/Redis coordination
 server/index.mjs       local signaling-server entrypoint

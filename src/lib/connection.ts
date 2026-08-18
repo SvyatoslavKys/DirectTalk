@@ -20,6 +20,7 @@ import {
   photoChunkCount,
   type PhotoMimeType,
 } from "./photos";
+import { logDiagnostic, safeErrorText } from "./diagnostics";
 
 export type ConnectionState =
   | "connecting-signaling"
@@ -96,11 +97,15 @@ export class DirectTalkConnection {
   private reconnectTimer?: number;
   private reconnectAttempts = 0;
   private peerGeneration = 0;
+  private lastStage = "created";
+  private localCandidateCount = 0;
+  private remoteCandidateCount = 0;
 
   constructor(private readonly options: ConnectionOptions) {}
 
   connect(): void {
     if (this.socket || this.closed || this.secureNotified) return;
+    this.trace("connect", { role: this.options.role });
     this.options.onState("connecting-signaling");
     if (!this.peerConnection) this.setupPeerConnection();
     this.openSignalingSocket();
@@ -108,26 +113,37 @@ export class DirectTalkConnection {
 
   private openSignalingSocket(): void {
     if (this.socket || this.closed || this.secureNotified) return;
-    const socket = new WebSocket(signalingUrl());
+    this.trace("signaling-opening");
+    let socket: WebSocket;
+    try {
+      socket = new WebSocket(signalingUrl());
+    } catch (error) {
+      this.fail(error, "signaling-constructor");
+      return;
+    }
     this.socket = socket;
     socket.addEventListener("open", () => {
       if (this.socket !== socket || this.closed) return;
+      this.trace("signaling-open");
       this.reconnectAttempts = 0;
       socket.send(JSON.stringify({ type: "join", roomId: this.options.roomId, role: this.options.role }));
+      this.trace("signaling-join-sent");
     });
     socket.addEventListener("message", (event) => {
       if (this.socket !== socket || this.closed) return;
       this.incomingQueue = this.incomingQueue
         .then(() => this.handleSignalMessage(event.data))
-        .catch((error: unknown) => this.fail(error));
+        .catch((error: unknown) => this.fail(error, "signaling-message"));
     });
     socket.addEventListener("error", () => {
       // The close event schedules a reconnect. Browsers intentionally expose no
       // useful details for WebSocket connection errors.
+      this.trace("signaling-error", undefined, "warn");
     });
     socket.addEventListener("close", (event) => {
       if (this.socket !== socket) return;
       this.socket = undefined;
+      this.trace("signaling-closed", { code: event.code, clean: event.wasClean }, event.wasClean ? "info" : "warn");
       if (!this.closed && !this.secureNotified) this.scheduleSignalingReconnect(event.reason);
     });
   }
@@ -135,12 +151,19 @@ export class DirectTalkConnection {
   async send(payload: Exclude<AppPayload, { kind: "session-ready" }>): Promise<void> {
     const operation = this.outgoingQueue.then(async () => {
       if (!this.session || !this.secureNotified || this.dataChannel?.readyState !== "open" || this.closed) {
+        this.trace("send-rejected", {
+          kind: payload.kind,
+          secure: this.secureNotified,
+          channelState: this.dataChannel?.readyState ?? "missing",
+          closed: this.closed,
+        }, "warn");
         throw new Error("Защищённое соединение ещё не готово");
       }
       const channel = this.dataChannel;
       const wire = await this.session.cipher.seal(payload);
       await waitForWritableChannel(channel);
       channel.send(wire);
+      this.trace("payload-sent", { kind: payload.kind });
     });
     this.outgoingQueue = operation.catch(() => undefined);
     return operation;
@@ -148,6 +171,7 @@ export class DirectTalkConnection {
 
   close(): void {
     if (this.closed) return;
+    this.trace("closing");
     this.closed = true;
     if (this.reconnectTimer !== undefined) window.clearTimeout(this.reconnectTimer);
     this.reconnectTimer = undefined;
@@ -161,16 +185,33 @@ export class DirectTalkConnection {
 
   private setupPeerConnection(): void {
     const generation = ++this.peerGeneration;
+    this.trace("peer-created", { generation });
     const peerConnection = new RTCPeerConnection(rtcConfiguration());
     this.peerConnection = peerConnection;
 
     peerConnection.addEventListener("icecandidate", (event) => {
       if (generation !== this.peerGeneration) return;
-      if (event.candidate) this.sendSignal({ candidate: event.candidate.toJSON() });
+      if (event.candidate) {
+        this.localCandidateCount += 1;
+        this.trace("local-ice-candidate", { count: this.localCandidateCount });
+        this.sendSignal({ candidate: event.candidate.toJSON() });
+      } else {
+        this.trace("ice-gathering-complete", { count: this.localCandidateCount });
+      }
+    });
+    peerConnection.addEventListener("icegatheringstatechange", () => {
+      if (generation === this.peerGeneration) this.trace("ice-gathering-state", { state: peerConnection.iceGatheringState });
+    });
+    peerConnection.addEventListener("iceconnectionstatechange", () => {
+      if (generation === this.peerGeneration) this.trace("ice-connection-state", { state: peerConnection.iceConnectionState });
+    });
+    peerConnection.addEventListener("signalingstatechange", () => {
+      if (generation === this.peerGeneration) this.trace("peer-signaling-state", { state: peerConnection.signalingState });
     });
     peerConnection.addEventListener("connectionstatechange", () => {
       if (generation !== this.peerGeneration) return;
-      if (peerConnection.connectionState === "failed") this.fail(new Error("Не удалось установить WebRTC-соединение"));
+      this.trace("peer-connection-state", { state: peerConnection.connectionState });
+      if (peerConnection.connectionState === "failed") this.fail(new Error("Не удалось установить WebRTC-соединение"), "peer-connection");
       if (peerConnection.connectionState === "closed" && !this.closed) this.close();
     });
     peerConnection.addEventListener("datachannel", (event) => {
@@ -178,6 +219,7 @@ export class DirectTalkConnection {
     });
 
     if (this.options.role === "creator") {
+      this.trace("data-channel-created");
       this.attachDataChannel(
         peerConnection.createDataChannel("directtalk-v1", {
           ordered: true,
@@ -190,37 +232,42 @@ export class DirectTalkConnection {
 
   private attachDataChannel(channel: RTCDataChannel, generation: number): void {
     if (this.dataChannel && this.dataChannel !== channel) {
+      this.trace("duplicate-data-channel", undefined, "warn");
       channel.close();
       return;
     }
+    this.trace("data-channel-attached", { generation, state: channel.readyState });
     this.dataChannel = channel;
     channel.binaryType = "arraybuffer";
     channel.addEventListener("open", () => {
       if (generation !== this.peerGeneration) return;
+      this.trace("data-channel-open");
       this.options.onState("authenticating");
-      void this.sendHello().catch((error: unknown) => this.fail(error));
+      void this.sendHello().catch((error: unknown) => this.fail(error, "handshake-send-hello"));
     });
     channel.addEventListener("message", (event) => {
       if (generation !== this.peerGeneration) return;
       if (typeof event.data !== "string" || event.data.length > 20_000) {
-        this.fail(new Error("Получен слишком большой или неподдерживаемый пакет"));
+        this.fail(new Error("Получен слишком большой или неподдерживаемый пакет"), "data-channel-packet-format");
         return;
       }
+      this.trace("data-channel-message", { bytes: event.data.length, phase: this.session ? "encrypted" : "handshake" });
       this.incomingQueue = this.incomingQueue
         .then(() => this.handleDataMessage(event.data))
-        .catch((error: unknown) => this.fail(error));
+        .catch((error: unknown) => this.fail(error, "data-channel-message"));
     });
     channel.addEventListener("close", () => {
-      if (generation === this.peerGeneration && !this.closed) this.fail(new Error("Прямое соединение закрыто"));
+      if (generation === this.peerGeneration && !this.closed) this.fail(new Error("Прямое соединение закрыто"), "data-channel-close");
     });
     channel.addEventListener("error", () => {
-      if (generation === this.peerGeneration) this.fail(new Error("Ошибка WebRTC DataChannel"));
+      if (generation === this.peerGeneration) this.fail(new Error("Ошибка WebRTC DataChannel"), "data-channel-error");
     });
   }
 
   private async handleSignalMessage(raw: unknown): Promise<void> {
     if (typeof raw !== "string") throw new Error("Некорректный ответ signaling-сервера");
     const message = JSON.parse(raw) as Record<string, unknown>;
+    this.trace("signaling-message", { type: typeof message.type === "string" ? message.type : "invalid" });
     if (message.type === "joined") {
       this.options.onState("waiting-peer");
       return;
@@ -254,26 +301,31 @@ export class DirectTalkConnection {
   private async createOffer(): Promise<void> {
     if (this.offerStarted) return;
     this.offerStarted = true;
+    this.trace("offer-creating");
     const peerConnection = this.requirePeerConnection();
     const offer = await peerConnection.createOffer();
     await peerConnection.setLocalDescription(offer);
+    this.trace("offer-local-set");
     this.sendSignal({ description: offer });
   }
 
   private async handleRemoteDescription(value: unknown): Promise<void> {
     if (!value || typeof value !== "object") throw new Error("Некорректное SDP");
     const description = value as RTCSessionDescriptionInit;
+    this.trace("remote-description", { type: typeof description.type === "string" ? description.type : "invalid" });
     if (description.type !== "offer" && description.type !== "answer") throw new Error("Некорректный тип SDP");
     if (this.options.role === "creator" && description.type !== "answer") throw new Error("Ожидался SDP answer");
     if (this.options.role === "joiner" && description.type !== "offer") throw new Error("Ожидался SDP offer");
 
     const peerConnection = this.requirePeerConnection();
     await peerConnection.setRemoteDescription(description);
+    this.trace("remote-description-set", { type: description.type, queuedCandidates: this.pendingCandidates.length });
     for (const candidate of this.pendingCandidates.splice(0)) await peerConnection.addIceCandidate(candidate);
 
     if (description.type === "offer") {
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
+      this.trace("answer-local-set");
       this.sendSignal({ description: answer });
     }
   }
@@ -285,15 +337,19 @@ export class DirectTalkConnection {
       throw new Error("Некорректный ICE candidate");
     }
     const peerConnection = this.requirePeerConnection();
+    this.remoteCandidateCount += 1;
+    this.trace("remote-ice-candidate", { count: this.remoteCandidateCount, queued: !peerConnection.remoteDescription });
     if (!peerConnection.remoteDescription) this.pendingCandidates.push(candidate);
     else await peerConnection.addIceCandidate(candidate);
   }
 
   private async sendHello(): Promise<void> {
     if (this.sentHello || this.dataChannel?.readyState !== "open") return;
+    this.trace("handshake-hello-preparing");
     const local = await this.getLocalHandshake();
     this.dataChannel.send(JSON.stringify(await sealHelloMessage(local.hello, this.options.inviteSecret)));
     this.sentHello = true;
+    this.trace("handshake-hello-sent");
   }
 
   private getLocalHandshake(): Promise<LocalHandshake> {
@@ -310,6 +366,7 @@ export class DirectTalkConnection {
   private async handleDataMessage(raw: string): Promise<void> {
     const value = JSON.parse(raw) as unknown;
     if (!this.session) {
+      this.trace("handshake-hello-received");
       if (this.remoteHello) throw new Error("Повторный handshake запрещён");
       const local = await this.getLocalHandshake();
       await this.sendHello();
@@ -322,12 +379,15 @@ export class DirectTalkConnection {
         this.options.expectedCreatorIdentity,
       );
       this.remoteHello = remote.hello;
+      this.trace("handshake-identity-verified");
       this.session = await deriveSession(local, remote, this.options.inviteSecret);
+      this.trace("handshake-session-derived");
       await this.sendSessionReady();
       return;
     }
 
     const payload = parseAppPayload(await this.session.cipher.open(value));
+    this.trace("payload-received", { kind: payload.kind });
     if (payload.kind === "session-ready") {
       this.receivedSessionReady = true;
       this.notifySecureIfReady();
@@ -341,12 +401,14 @@ export class DirectTalkConnection {
     if (!this.session || this.sentSessionReady || this.dataChannel?.readyState !== "open") return;
     this.dataChannel.send(await this.session.cipher.seal({ kind: "session-ready" } satisfies AppPayload));
     this.sentSessionReady = true;
+    this.trace("session-ready-sent");
     this.notifySecureIfReady();
   }
 
   private notifySecureIfReady(): void {
     if (!this.session || !this.remoteHello || !this.sentSessionReady || !this.receivedSessionReady || this.secureNotified) return;
     this.secureNotified = true;
+    this.trace("secure-session-established");
     this.options.onState("secure");
     this.options.onSecure({
       id: this.session.peerId,
@@ -365,6 +427,7 @@ export class DirectTalkConnection {
     this.resetPeerConnection();
     const delay = Math.min(500 * 2 ** this.reconnectAttempts, 5_000);
     this.reconnectAttempts += 1;
+    this.trace("signaling-reconnect-scheduled", { attempt: this.reconnectAttempts, delay }, "warn");
     this.options.onState("connecting-signaling");
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = undefined;
@@ -375,6 +438,7 @@ export class DirectTalkConnection {
   }
 
   private resetPeerConnection(): void {
+    this.trace("peer-reset", { generation: this.peerGeneration + 1 }, "warn");
     this.peerGeneration += 1;
     this.dataChannel?.close();
     this.peerConnection?.close();
@@ -388,14 +452,17 @@ export class DirectTalkConnection {
     this.receivedSessionReady = false;
     this.offerStarted = false;
     this.pendingCandidates = [];
+    this.localCandidateCount = 0;
+    this.remoteCandidateCount = 0;
   }
 
   private sendSignal(payload: Record<string, unknown>): void {
     if (this.socket?.readyState !== WebSocket.OPEN) {
-      if (!this.closed && !this.secureNotified) this.fail(new Error("Signaling-соединение недоступно"));
+      if (!this.closed && !this.secureNotified) this.fail(new Error("Signaling-соединение недоступно"), "signaling-send");
       return;
     }
     this.socket.send(JSON.stringify({ type: "signal", payload }));
+    this.trace("signal-sent", { kind: "description" in payload ? "description" : "candidate" });
   }
 
   private requirePeerConnection(): RTCPeerConnection {
@@ -403,11 +470,21 @@ export class DirectTalkConnection {
     return this.peerConnection;
   }
 
-  private fail(error: unknown): void {
+  private fail(error: unknown, stage = this.lastStage): void {
     if (this.closed) return;
     const message = error instanceof Error ? error.message : "Неизвестная ошибка соединения";
+    logDiagnostic("connection", "failed", { stage, reason: safeErrorText(error) }, "error");
     this.options.onError(message);
     this.close();
+  }
+
+  private trace(
+    event: string,
+    details?: Record<string, string | number | boolean | null | undefined>,
+    level: "info" | "warn" | "error" = "info",
+  ): void {
+    this.lastStage = event;
+    logDiagnostic("connection", event, details, level);
   }
 }
 

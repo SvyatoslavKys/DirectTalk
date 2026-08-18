@@ -744,32 +744,6 @@ textarea:focus {
   cursor: pointer;
 }
 
-.demo-button {
-  min-height: 36px;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 7px;
-  color: var(--accent-strong);
-  background: linear-gradient(#ffffffc9, var(--panel-strong));
-  border: 1px solid var(--line);
-  border-radius: 5px;
-  box-shadow: inset 1px 1px 0 #fff, 0 1px 2px var(--shadow);
-  font-size: 11px;
-  font-weight: 800;
-  cursor: pointer;
-}
-
-.demo-button:hover {
-  background: linear-gradient(#fff, var(--accent-pale));
-  border-color: var(--accent-strong);
-}
-
-.demo-button:active {
-  transform: translateY(1px);
-  box-shadow: inset 1px 2px 3px var(--shadow);
-}
-
 .primary-button {
   margin-top: 4px;
   display: flex;
@@ -1127,13 +1101,6 @@ textarea:focus {
 
 .session-notice svg {
   width: 12px;
-}
-
-.session-notice.demo {
-  color: var(--accent-strong);
-  background: var(--accent-pale);
-  border-color: var(--accent);
-  font-weight: 700;
 }
 
 .history-clear-request {
@@ -1927,6 +1894,162 @@ textarea:focus {
   padding: 0 18px;
 }
 
+.diagnostics-trigger {
+  min-height: 31px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 3px 9px;
+  color: var(--text);
+  background: linear-gradient(#fff, var(--panel-strong));
+  border: 1px solid var(--line-dark);
+  border-radius: 4px;
+  box-shadow: inset 1px 1px 0 #fff, 1px 1px 2px var(--shadow);
+  font: inherit;
+  cursor: pointer;
+}
+
+.diagnostics-trigger span {
+  width: 17px;
+  height: 17px;
+  display: grid;
+  place-items: center;
+  color: white;
+  background: var(--accent-strong);
+  border: 1px solid var(--line-dark);
+  border-radius: 50%;
+  font-weight: 900;
+  font-style: normal;
+}
+
+.diagnostics-trigger b {
+  font-weight: 700;
+}
+
+.diagnostics-error-button {
+  min-height: 34px;
+  margin: 14px 6px 0;
+  padding: 5px 14px;
+  color: var(--text);
+  background: linear-gradient(#fff, var(--panel-strong));
+  border: 1px solid var(--line-dark);
+  border-radius: 4px;
+  box-shadow: inset 1px 1px 0 #fff, 1px 1px 2px var(--shadow);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.error-diagnostic-id {
+  display: block;
+  width: fit-content;
+  margin: 10px auto 0;
+  padding: 4px 7px;
+  color: var(--muted);
+  background: var(--panel);
+  border: 1px solid var(--line-soft);
+  font-size: 9px;
+}
+
+.diagnostics-backdrop {
+  position: fixed;
+  z-index: 1200;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 18px;
+  background: rgb(4 15 18 / 58%);
+  backdrop-filter: blur(2px);
+}
+
+.diagnostics-panel {
+  width: min(820px, 100%);
+  max-height: min(760px, calc(100dvh - 36px));
+  display: flex;
+  flex-direction: column;
+  background: var(--panel);
+}
+
+.diagnostics-body {
+  min-height: 0;
+  display: flex;
+  flex: 1;
+  flex-direction: column;
+  gap: 13px;
+  padding: 18px;
+}
+
+.diagnostics-heading {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+
+.diagnostics-heading h2 {
+  margin: 0 0 5px;
+  font-size: 18px;
+}
+
+.diagnostics-heading p {
+  max-width: 620px;
+  margin: 0;
+  color: var(--muted);
+  font-size: 10px;
+  line-height: 1.5;
+}
+
+.diagnostics-heading > span {
+  min-width: 30px;
+  padding: 4px 7px;
+  color: white;
+  background: var(--accent-strong);
+  border: 1px solid var(--line-dark);
+  border-radius: 10px;
+  text-align: center;
+  font-size: 9px;
+}
+
+.diagnostics-body textarea {
+  width: 100%;
+  min-height: 310px;
+  flex: 1;
+  resize: vertical;
+  padding: 11px;
+  color: var(--text);
+  background: color-mix(in srgb, var(--panel) 75%, #000 8%);
+  border: 1px solid var(--line-dark);
+  border-radius: 0;
+  box-shadow: inset 1px 1px 4px var(--shadow);
+  font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow: auto;
+}
+
+.diagnostics-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 8px;
+}
+
+.diagnostics-actions button {
+  min-height: 34px;
+  padding: 5px 12px;
+  color: var(--text);
+  background: linear-gradient(#fff, var(--panel-strong));
+  border: 1px solid var(--line-dark);
+  border-radius: 4px;
+  box-shadow: inset 1px 1px 0 #fff, 1px 1px 2px var(--shadow);
+  font: inherit;
+  font-weight: 700;
+  cursor: pointer;
+}
+
+.diagnostics-actions .primary-button {
+  min-width: auto;
+  margin: 0;
+}
+
 .page-footer {
   display: flex;
   justify-content: space-between;
@@ -1989,6 +2112,28 @@ textarea:focus {
 
   .privacy-note {
     display: none;
+  }
+
+  .diagnostics-backdrop {
+    padding: 0;
+  }
+
+  .diagnostics-panel {
+    width: 100%;
+    height: 100dvh;
+    max-height: none;
+    border: 0;
+    border-radius: 0;
+  }
+
+  .diagnostics-body {
+    padding: 13px;
+  }
+
+  .diagnostics-body textarea {
+    min-height: 0;
+    resize: none;
+    font-size: 9px;
   }
 
   .chat-language-picker {
@@ -2178,6 +2323,15 @@ textarea:focus {
 
   .top-actions {
     gap: 4px;
+  }
+
+  .diagnostics-trigger {
+    width: 31px;
+    padding: 3px 6px;
+  }
+
+  .diagnostics-trigger b {
+    display: none;
   }
 
   .language-picker {

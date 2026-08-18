@@ -48,8 +48,17 @@ import {
   validatePhotoSignature,
 } from "./lib/photos";
 import type { IdentityKeys, PeerRole } from "./lib/protocol";
+import {
+  clearDiagnostics,
+  formatDiagnosticReport,
+  getDiagnosticEntries,
+  initializeDiagnostics,
+  logDiagnostic,
+  safeErrorText,
+  subscribeDiagnostics,
+} from "./lib/diagnostics";
 
-type Screen = "loading" | "home" | "waiting" | "chat" | "demo" | "error";
+type Screen = "loading" | "home" | "waiting" | "chat" | "error";
 type ThemeId = "lime" | "aqua" | "midnight";
 type PhotoTransferStatus = "preparing" | "waiting" | "transferring" | "receiving" | "complete" | "declined" | "cancelled" | "failed";
 type DeleteScope = "local" | "everyone";
@@ -89,65 +98,6 @@ const classicEmoji = [
   "🎉", "🌼", "☕", "🍺", "🚀", "💾", "☎️", "👋",
 ];
 
-const demoPeer: SecurePeer = {
-  id: "directtalk-demo-peer",
-  name: "Sasha",
-  identityKey: "demo-identity-key",
-  fingerprint: "7B:21:9D:04:AE:88:13:F2:65:CC:40:1A:9E:73:B6:20",
-  securityCode: "482 771 095 314",
-};
-
-function createDemoContact(): StoredContact {
-  const now = Date.now();
-  return {
-    id: demoPeer.id,
-    name: demoPeer.name,
-    identityKey: demoPeer.identityKey,
-    fingerprint: demoPeer.fingerprint,
-    verified: false,
-    firstSeenAt: now,
-    lastSeenAt: now,
-  };
-}
-
-function createDemoMessages(): StoredMessage[] {
-  const now = Date.now();
-  return [
-    {
-      id: "demo-1",
-      chatId: demoPeer.id,
-      sender: "peer",
-      text: "Привет! Ты уже посмотрел новый дизайн? 🙂",
-      createdAt: now - 9 * 60_000,
-      status: "read",
-    },
-    {
-      id: "demo-2",
-      chatId: demoPeer.id,
-      sender: "me",
-      text: "Да! Очень напоминает старую аську — в хорошем смысле.",
-      createdAt: now - 7 * 60_000,
-      status: "read",
-    },
-    {
-      id: "demo-3",
-      chatId: demoPeer.id,
-      sender: "peer",
-      text: "Класс! Давай добавим смайлики, файлы и голосовые 📎",
-      createdAt: now - 4 * 60_000,
-      status: "read",
-    },
-    {
-      id: "demo-4",
-      chatId: demoPeer.id,
-      sender: "me",
-      text: "Смайлики уже работают 😎 Остальное добавим следующим этапом.",
-      createdAt: now - 2 * 60_000,
-      status: "read",
-    },
-  ];
-}
-
 const stateLabelKeys: Record<ConnectionState, TranslationKey> = {
   "connecting-signaling": "state.connectingSignaling",
   "waiting-peer": "state.waitingPeer",
@@ -157,11 +107,21 @@ const stateLabelKeys: Record<ConnectionState, TranslationKey> = {
   closed: "state.closed",
 };
 
-const demoMessageKeys: Record<string, TranslationKey> = {
-  "demo-1": "demo.message1",
-  "demo-2": "demo.message2",
-  "demo-3": "demo.message3",
-  "demo-4": "demo.message4",
+
+const diagnosticsCopy: Record<Language, {
+  button: string;
+  title: string;
+  description: string;
+  copy: string;
+  copied: string;
+  share: string;
+  clear: string;
+  close: string;
+}> = {
+  en: { button: "Diagnostics", title: "Connection diagnostics", description: "Safe technical events only. Messages, files, keys, invitation secrets, SDP, ICE candidates and IP addresses are excluded.", copy: "Copy logs", copied: "Copied ✓", share: "Share", clear: "Clear", close: "Close" },
+  pl: { button: "Diagnostyka", title: "Diagnostyka połączenia", description: "Tylko bezpieczne zdarzenia techniczne. Wiadomości, pliki, klucze, sekrety zaproszeń, SDP, kandydaci ICE i adresy IP są pomijane.", copy: "Kopiuj logi", copied: "Skopiowano ✓", share: "Udostępnij", clear: "Wyczyść", close: "Zamknij" },
+  ru: { button: "Диагностика", title: "Диагностика соединения", description: "Только безопасные технические события. Сообщения, файлы, ключи, секрет приглашения, SDP, ICE-кандидаты и IP-адреса не записываются.", copy: "Копировать логи", copied: "Скопировано ✓", share: "Поделиться", clear: "Очистить", close: "Закрыть" },
+  uk: { button: "Діагностика", title: "Діагностика з'єднання", description: "Лише безпечні технічні події. Повідомлення, файли, ключі, секрет запрошення, SDP, ICE-кандидати та IP-адреси не записуються.", copy: "Копіювати логи", copied: "Скопійовано ✓", share: "Поділитися", clear: "Очистити", close: "Закрити" },
 };
 
 export default function App() {
@@ -179,10 +139,7 @@ export default function App() {
   const [peer, setPeer] = useState<SecurePeer | null>(null);
   const [contact, setContact] = useState<StoredContact | null>(null);
   const [messages, setMessages] = useState<StoredMessage[]>([]);
-  const [demoContact, setDemoContact] = useState<StoredContact>(() => createDemoContact());
-  const [demoMessages, setDemoMessages] = useState<StoredMessage[]>(() => createDemoMessages());
   const [attachments, setAttachments] = useState<Record<string, StoredAttachment>>({});
-  const [demoAttachments, setDemoAttachments] = useState<Record<string, StoredAttachment>>({});
   const [incomingPhotoOffers, setIncomingPhotoOffers] = useState<PhotoOfferPayload[]>([]);
   const [photoTransfers, setPhotoTransfers] = useState<Record<string, PhotoTransfer>>({});
   const [photoError, setPhotoError] = useState("");
@@ -199,6 +156,8 @@ export default function App() {
   const [showSecurity, setShowSecurity] = useState(false);
   const [showEmoji, setShowEmoji] = useState(false);
   const [showThemes, setShowThemes] = useState(false);
+  const [showDiagnostics, setShowDiagnostics] = useState(false);
+  const [errorDiagnosticId, setErrorDiagnosticId] = useState<number | null>(null);
   const [theme, setTheme] = useState<ThemeId>(() => readTheme());
   const [showSplash, setShowSplash] = useState(true);
   const connectionRef = useRef<DirectTalkConnection | null>(null);
@@ -224,25 +183,26 @@ export default function App() {
     [incomingInvite],
   );
 
+  useEffect(() => initializeDiagnostics(), []);
+
   useEffect(() => {
     if (!window.isSecureContext || !crypto.subtle || !window.RTCPeerConnection) {
-      setError(translate(language, "error.browser"));
-      setScreen("error");
+      showFatalError(translate(language, "error.browser"), "browser-requirements");
       return;
     }
+    logDiagnostic("app", "browser-requirements-ok");
     void getOrCreateIdentity()
       .then((keys) => {
+        logDiagnostic("identity", "ready");
         setIdentity(keys);
         if (invalidInvite) {
-          setError(translate(language, "error.invite"));
-          setScreen("error");
+          showFatalError(translate(language, "error.invite"), "invitation-validation");
         } else {
           setScreen("home");
         }
       })
       .catch((reason: unknown) => {
-        setError(reason instanceof Error ? reason.message : translate(language, "error.identity"));
-        setScreen("error");
+        showFatalError(reason instanceof Error ? reason.message : translate(language, "error.identity"), "identity-setup");
       });
   }, [invalidInvite]);
 
@@ -282,13 +242,16 @@ export default function App() {
       margin: 2,
       width: 260,
       color: { dark: "#081119", light: "#f7faf8" },
-    }).then(setQrCode).catch(() => setQrCode(""));
+    }).then(setQrCode).catch((reason) => {
+      logDiagnostic("invite", "qr-generation-failed", { reason: safeErrorText(reason) }, "warn");
+      setQrCode("");
+    });
   }, [inviteLink]);
 
   useEffect(() => {
     const list = messageListRef.current;
     if (list) list.scrollTop = list.scrollHeight;
-  }, [messages, demoMessages, incomingPhotoOffers, incomingClearRequest, historyNotice]);
+  }, [messages, incomingPhotoOffers, incomingClearRequest, historyNotice]);
 
   useEffect(() => {
     const markVisibleMessagesRead = () => {
@@ -315,6 +278,7 @@ export default function App() {
     setInvitation(nextInvitation);
     setInviteLink(link);
     setScreen("waiting");
+    logDiagnostic("app", "creator-started");
     startConnection(nextInvitation, "creator");
   }
 
@@ -324,6 +288,7 @@ export default function App() {
     clearInvitationFromAddressBar();
     setInvitation(incomingInvite);
     setScreen("waiting");
+    logDiagnostic("app", "joiner-started");
     startConnection(incomingInvite, "joiner");
     setIncomingInvite(null);
   }
@@ -354,14 +319,17 @@ export default function App() {
       identity: identity!,
       displayName: displayName.trim().normalize("NFC"),
       expectedCreatorIdentity: role === "joiner" ? nextInvitation.creatorIdentity : undefined,
-      onState: setConnectionState,
+      onState: (state) => {
+        logDiagnostic("app", "connection-state", { state });
+        setConnectionState(state);
+      },
       onSecure: (securePeer) => {
+        logDiagnostic("app", "secure-peer-ready");
         void handleSecurePeer(securePeer).catch(handleLocalError);
       },
       onPayload: (payload) => handlePayload(directConnection, payload),
       onError: (message) => {
-        setError(message);
-        setScreen("error");
+        showFatalError(message, "connection-callback");
       },
     });
     connectionRef.current = directConnection;
@@ -391,7 +359,15 @@ export default function App() {
     setContact(nextContact);
     setMessages(history);
     setAttachments(indexAttachments(storedAttachments));
+    logDiagnostic("storage", "chat-history-loaded", { messages: history.length, attachments: storedAttachments.length });
     setScreen("chat");
+  }
+
+  function showFatalError(message: string, stage: string) {
+    const diagnosticId = logDiagnostic("app", "fatal-error", { stage, reason: safeErrorText(message) }, "error");
+    setErrorDiagnosticId(diagnosticId);
+    setError(message);
+    setScreen("error");
   }
 
   async function handlePayload(connection: DirectTalkConnection, payload: Exclude<AppPayload, { kind: "session-ready" }>) {
@@ -494,7 +470,7 @@ export default function App() {
       let deleted = allowed;
       if (stored && allowed) {
         try {
-          await deleteMessageLocally(payload.messageId, false);
+          await deleteMessageLocally(payload.messageId);
         } catch {
           deleted = false;
         }
@@ -516,7 +492,7 @@ export default function App() {
         return;
       }
       try {
-        if (stored) await deleteMessageLocally(payload.messageId, false);
+        if (stored) await deleteMessageLocally(payload.messageId);
         setHistoryNotice(t("notice.deletedEveryone"));
       } catch {
         setHistoryNotice(t("notice.deletedRemoteLocalFailed"));
@@ -544,7 +520,7 @@ export default function App() {
         return;
       }
       try {
-        await clearChatLocally(currentPeer.id, false, connection);
+        await clearChatLocally(currentPeer.id, connection);
         setHistoryNotice(t("notice.clearedEveryone"));
       } catch {
         setHistoryNotice(t("notice.clearedRemoteLocalFailed"));
@@ -709,21 +685,6 @@ export default function App() {
     event.preventDefault();
     const text = draft.trim();
 
-    if (screen === "demo") {
-      if (!text || text.length > 4_000) return;
-      const demoMessage: StoredMessage = {
-        id: crypto.randomUUID(),
-        chatId: demoPeer.id,
-        sender: "me",
-        text,
-        createdAt: Date.now(),
-        status: "read",
-      };
-      setDraft("");
-      setDemoMessages((current) => upsertMessage(current, demoMessage));
-      return;
-    }
-
     const currentPeer = peerRef.current;
     const connection = connectionRef.current;
     if (!text || text.length > 4_000 || !currentPeer || !connection) return;
@@ -741,10 +702,12 @@ export default function App() {
     setMessages((current) => upsertMessage(current, message));
     try {
       await connection.send({ kind: "chat-message", id: message.id, text: message.text, createdAt: message.createdAt });
+      logDiagnostic("chat", "message-sent");
     } catch (reason) {
       await db.messages.update(message.id, { status: "failed" });
       setMessages((current) => current.map((item) => (item.id === message.id ? { ...item, status: "failed" } : item)));
       setError(reason instanceof Error ? reason.message : t("error.messageSend"));
+      logDiagnostic("chat", "message-send-failed", { reason: safeErrorText(reason) }, "error");
     }
   }
 
@@ -776,7 +739,7 @@ export default function App() {
       if (generation !== chatGenerationRef.current) return;
       const sha256 = await hashPhoto(file);
       if (generation !== chatGenerationRef.current) return;
-      const chatId = screen === "demo" ? demoPeer.id : peerRef.current?.id;
+      const chatId = peerRef.current?.id;
       if (!chatId) throw new Error(t("error.secureNotReady"));
 
       const attachment: StoredAttachment = {
@@ -798,15 +761,8 @@ export default function App() {
         kind: "photo",
         attachmentId: id,
         createdAt,
-        status: screen === "demo" ? "read" : "sending",
+        status: "sending",
       };
-
-      if (screen === "demo") {
-        setDemoAttachments((current) => ({ ...current, [id]: attachment }));
-        setDemoMessages((current) => upsertMessage(current, message));
-        setPhotoTransfer(id, { status: "complete", progress: 1 });
-        return;
-      }
 
       const connection = connectionRef.current;
       if (!connection) throw new Error(t("error.secureNotReady"));
@@ -907,11 +863,9 @@ export default function App() {
         await cancelPhotoTransfer(confirmation.messageId);
       }
 
-      if (confirmation.scope === "local" || screen === "demo") {
-        await deleteMessageLocally(confirmation.messageId, screen === "demo");
-        setHistoryNotice(screen === "demo" && confirmation.scope === "everyone"
-          ? t("notice.demoDeleted")
-          : t("notice.deletedLocal"));
+      if (confirmation.scope === "local") {
+        await deleteMessageLocally(confirmation.messageId);
+        setHistoryNotice(t("notice.deletedLocal"));
         return;
       }
 
@@ -930,21 +884,16 @@ export default function App() {
     }
   }
 
-  async function deleteMessageLocally(messageId: string, demoMode: boolean): Promise<void> {
-    if (demoMode) {
-      setDemoMessages((current) => current.filter((message) => message.id !== messageId));
-      setDemoAttachments((current) => removeMessageAttachments(current, messageId));
-    } else {
-      const currentPeer = peerRef.current;
-      const stored = await db.messages.get(messageId);
-      if (!currentPeer || !stored || stored.chatId !== currentPeer.id) return;
-      await db.transaction("rw", db.messages, db.attachments, async () => {
-        await db.attachments.where("messageId").equals(messageId).delete();
-        await db.messages.delete(messageId);
-      });
-      setMessages((current) => current.filter((message) => message.id !== messageId));
-      setAttachments((current) => removeMessageAttachments(current, messageId));
-    }
+  async function deleteMessageLocally(messageId: string): Promise<void> {
+    const currentPeer = peerRef.current;
+    const stored = await db.messages.get(messageId);
+    if (!currentPeer || !stored || stored.chatId !== currentPeer.id) return;
+    await db.transaction("rw", db.messages, db.attachments, async () => {
+      await db.attachments.where("messageId").equals(messageId).delete();
+      await db.messages.delete(messageId);
+    });
+    setMessages((current) => current.filter((message) => message.id !== messageId));
+    setAttachments((current) => removeMessageAttachments(current, messageId));
     setPhotoTransfers((current) => {
       if (!(messageId in current)) return current;
       const next = { ...current };
@@ -985,11 +934,11 @@ export default function App() {
   }
 
   async function clearOnlyThisBrowser() {
-    if (!activePeer) return;
+    if (!peer) return;
     setShowClearDialog(false);
     setHistoryNotice("");
     try {
-      await clearChatLocally(activePeer.id, isDemo, connectionRef.current);
+      await clearChatLocally(peer.id, connectionRef.current);
       setHistoryNotice(t("notice.clearedLocal"));
     } catch (reason) {
       setHistoryNotice(reason instanceof Error ? reason.message : t("notice.clearLocalFailed"));
@@ -997,14 +946,9 @@ export default function App() {
   }
 
   async function requestClearForEveryone() {
-    if (!activePeer) return;
+    if (!peer) return;
     setShowClearDialog(false);
     setHistoryNotice("");
-    if (isDemo) {
-      await clearChatLocally(activePeer.id, true, null);
-      setHistoryNotice(t("notice.demoCleared"));
-      return;
-    }
     const connection = connectionRef.current;
     if (!connection || pendingClearRequestRef.current) {
       setHistoryNotice(t("notice.clearUnavailable"));
@@ -1036,7 +980,7 @@ export default function App() {
     incomingClearRequestRef.current = null;
     setIncomingClearRequest(null);
     try {
-      await clearChatLocally(currentPeer.id, false, connection);
+      await clearChatLocally(currentPeer.id, connection);
       await connection.send({ kind: "clear-chat-response", id, accepted: true });
       setHistoryNotice(t("notice.clearedEveryone"));
     } catch (reason) {
@@ -1060,7 +1004,6 @@ export default function App() {
 
   async function clearChatLocally(
     chatId: string,
-    demoMode: boolean,
     connection: DirectTalkConnection | null,
   ) {
     chatGenerationRef.current += 1;
@@ -1069,12 +1012,6 @@ export default function App() {
     setMessageMenuId(null);
     setDeleteConfirmation(null);
     setPhotoError("");
-
-    if (demoMode) {
-      setDemoMessages([]);
-      setDemoAttachments({});
-      return;
-    }
 
     await db.transaction("rw", db.messages, db.attachments, async () => {
       await db.attachments.where("chatId").equals(chatId).delete();
@@ -1123,10 +1060,6 @@ export default function App() {
   }
 
   async function verifyContact() {
-    if (screen === "demo") {
-      setDemoContact((current) => ({ ...current, verified: true }));
-      return;
-    }
     if (!contact) return;
     await db.contacts.update(contact.id, { verified: true });
     setContact({ ...contact, verified: true });
@@ -1146,6 +1079,7 @@ export default function App() {
   }
 
   function handleLocalError(reason: unknown) {
+    logDiagnostic("storage", "local-operation-failed", { reason: safeErrorText(reason) }, "error");
     setError(reason instanceof Error ? reason.message : t("error.storage"));
   }
 
@@ -1154,12 +1088,14 @@ export default function App() {
       await navigator.clipboard.writeText(inviteLink);
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1_800);
-    } catch {
+    } catch (reason) {
+      logDiagnostic("invite", "clipboard-copy-failed", { reason: safeErrorText(reason) }, "warn");
       setError(t("error.clipboard"));
     }
   }
 
   function reset() {
+    logDiagnostic("app", "returned-home");
     chatGenerationRef.current += 1;
     for (const id of outgoingPhotosRef.current.keys()) cancelledPhotosRef.current.add(id);
     for (const id of incomingPhotosRef.current.keys()) cancelledPhotosRef.current.add(id);
@@ -1190,53 +1126,20 @@ export default function App() {
     setIncomingInvite(null);
     setInviteLink("");
     setError("");
+    setErrorDiagnosticId(null);
     setShowEmoji(false);
     setShowSecurity(false);
     setScreen("home");
   }
 
-  function openDemo() {
-    chatGenerationRef.current += 1;
-    for (const id of outgoingPhotosRef.current.keys()) cancelledPhotosRef.current.add(id);
-    for (const id of incomingPhotosRef.current.keys()) cancelledPhotosRef.current.add(id);
-    connectionRef.current?.close();
-    connectionRef.current = null;
-    peerRef.current = null;
-    sessionStartedAtRef.current = Date.now();
-    setDemoContact(createDemoContact());
-    setDemoMessages(createDemoMessages());
-    setDemoAttachments({});
-    setIncomingPhotoOffers([]);
-    setPhotoTransfers({});
-    setPhotoError("");
-    outgoingPhotosRef.current.clear();
-    sendingPhotosRef.current.clear();
-    incomingPhotosRef.current.clear();
-    incomingPhotoOffersRef.current.clear();
-    clearPendingDeletes();
-    finishPendingClearRequest();
-    incomingClearRequestRef.current = null;
-    setIncomingClearRequest(null);
-    setMessageMenuId(null);
-    setDeleteConfirmation(null);
-    setShowClearDialog(false);
-    setHistoryNotice("");
-    setDraft("");
-    setError("");
-    setShowEmoji(false);
-    setShowSecurity(false);
-    setScreen("demo");
-  }
-
-  const isDemo = screen === "demo";
-  const activePeer = isDemo ? { ...demoPeer, name: t("demo.peer") } : peer;
-  const activeContact = isDemo ? demoContact : contact;
-  const activeMessages = isDemo ? demoMessages : messages;
-  const activeAttachments = isDemo ? demoAttachments : attachments;
+  const activePeer = peer;
+  const activeContact = contact;
+  const activeMessages = messages;
+  const activeAttachments = attachments;
   const incomingTransfers = Object.values(photoTransfers).filter(
     (transfer) => transfer.direction === "incoming" && transfer.status !== "complete",
   );
-  const isConversationOpen = screen === "chat" || isDemo;
+  const isConversationOpen = screen === "chat";
 
   return (
     <>
@@ -1300,6 +1203,16 @@ export default function App() {
               </div>
             )}
           </div>
+          <button
+            className="diagnostics-trigger"
+            type="button"
+            onClick={() => setShowDiagnostics(true)}
+            title={diagnosticsCopy[language].title}
+            aria-label={diagnosticsCopy[language].title}
+          >
+            <span aria-hidden="true">i</span>
+            <b>{diagnosticsCopy[language].button}</b>
+          </button>
         </div>
       </header>
 
@@ -1332,10 +1245,6 @@ export default function App() {
               <button className="primary-button" type="submit">
                 <span aria-hidden="true">{incomingInvite ? "↗" : "+"}</span>
                 {incomingInvite ? t("home.connect") : t("home.create")}
-              </button>
-              <button className="demo-button" type="button" onClick={openDemo}>
-                <span aria-hidden="true">▤</span>
-                {t("home.demo")}
               </button>
             </form>
 
@@ -1387,7 +1296,7 @@ export default function App() {
       {isConversationOpen && activePeer && activeContact && (
         <section className="chat-card y2k-window">
           <WindowTitlebar
-            title={`${activePeer.name} — ${isDemo ? t("chat.demoTitle") : t("chat.title")}`}
+            title={`${activePeer.name} — ${t("chat.title")}`}
             onClose={reset}
             closeLabel={t("common.close")}
             extra={(
@@ -1431,7 +1340,7 @@ export default function App() {
                 <span>{t("security.code")}</span>
                 <code>{activePeer.securityCode}</code>
               </div>
-              <p>{isDemo ? t("security.demoDescription") : t("security.description")}</p>
+              <p>{t("security.description")}</p>
               <details>
                 <summary>{t("security.fingerprint")}</summary>
                 <code>{activePeer.fingerprint}</code>
@@ -1443,7 +1352,7 @@ export default function App() {
           <div className="chat-workspace">
             <div className="conversation-pane">
               <div className="message-list" ref={messageListRef} aria-live="polite">
-                <div className={`session-notice ${isDemo ? "demo" : ""}`}><LockIcon /> {isDemo ? t("session.demo") : t("session.secure")} · {formatTime(sessionStartedAtRef.current, language)}</div>
+                <div className="session-notice"><LockIcon /> {t("session.secure")} · {formatTime(sessionStartedAtRef.current, language)}</div>
                 {incomingClearRequest && (
                   <section className="history-clear-request" role="alert">
                     <div><strong>{t("clearRequest.title", { name: activePeer.name })}</strong><span>{t("clearRequest.description")}</span></div>
@@ -1506,7 +1415,7 @@ export default function App() {
                         onCancel={() => void cancelPhotoTransfer(message.id)}
                         language={language}
                       />
-                    ) : <p>{isDemo && demoMessageKeys[message.id] ? t(demoMessageKeys[message.id]) : message.text}</p>}
+                    ) : <p>{message.text}</p>}
                     {messageMenuId === message.id && (
                       <div className="message-actions-menu" role="menu">
                         <button type="button" role="menuitem" onClick={() => {
@@ -1583,7 +1492,7 @@ export default function App() {
                 <LockIcon />
                 {activeContact.verified ? t("peer.verified") : t("peer.compare")}
               </button>
-              <p>{isDemo ? t("peer.demoDescription") : t("peer.directDescription")}</p>
+              <p>{t("peer.directDescription")}</p>
             </aside>
           </div>
 
@@ -1596,9 +1505,7 @@ export default function App() {
                   <div>
                     <h2 id="delete-dialog-title">{t("delete.title")}</h2>
                     <p>{deleteConfirmation.scope === "everyone"
-                      ? isDemo
-                        ? t("delete.demoDescription")
-                        : t("delete.everyoneDescription")
+                      ? t("delete.everyoneDescription")
                       : t("delete.localDescription")}</p>
                   </div>
                 </div>
@@ -1623,14 +1530,14 @@ export default function App() {
                 </div>
                 <div className="clear-dialog-options">
                   <button type="button" onClick={() => void clearOnlyThisBrowser()}><strong>{t("clear.local")}</strong><span>{t("clear.localDescription")}</span></button>
-                  <button type="button" onClick={() => void requestClearForEveryone()}><strong>{isDemo ? t("clear.demo") : t("clear.everyone")}</strong><span>{isDemo ? t("clear.demoDescription") : t("clear.everyoneDescription")}</span></button>
+                  <button type="button" onClick={() => void requestClearForEveryone()}><strong>{t("clear.everyone")}</strong><span>{t("clear.everyoneDescription")}</span></button>
                 </div>
                 <div className="confirm-dialog-actions"><button type="button" onClick={() => setShowClearDialog(false)}>{t("common.cancel")}</button></div>
               </section>
             </div>
           )}
 
-          <div className="window-statusbar"><span>● {activePeer.name}: {t("peer.online")}</span><span>{t("status.messages", { count: activeMessages.length })}</span><span>{isDemo ? "DEMO · LOCAL" : "WebRTC · E2EE"}</span></div>
+          <div className="window-statusbar"><span>● {activePeer.name}: {t("peer.online")}</span><span>{t("status.messages", { count: activeMessages.length })}</span><span>WebRTC · E2EE</span></div>
         </section>
       )}
 
@@ -1641,10 +1548,14 @@ export default function App() {
             <div className="error-icon">!</div>
             <h1>{t("error.title")}</h1>
             <p>{localizeRuntimeMessage(language, error)}</p>
+            {errorDiagnosticId !== null && <code className="error-diagnostic-id">Diagnostic ID #{errorDiagnosticId}</code>}
+            <button className="diagnostics-error-button" type="button" onClick={() => setShowDiagnostics(true)}>{diagnosticsCopy[language].button}</button>
             <button className="primary-button" type="button" onClick={reset}>{t("error.back")}</button>
           </div>
         </section>
       )}
+
+        {showDiagnostics && <DiagnosticsPanel language={language} onClose={() => setShowDiagnostics(false)} />}
 
         <footer className="page-footer"><span>DirectTalk 0.1</span><span>{t("footer.history")}</span></footer>
       </main>
@@ -1658,6 +1569,56 @@ function SplashScreen() {
       <div className="splash-glow" />
       <img className="splash-logo" src={oxalisLogo} alt="" draggable="false" />
       <span className="splash-name">DirectTalk</span>
+    </div>
+  );
+}
+
+function DiagnosticsPanel({ language, onClose }: { language: Language; onClose: () => void }) {
+  const copy = diagnosticsCopy[language];
+  const [, setRevision] = useState(0);
+  const [copied, setCopied] = useState(false);
+  const report = formatDiagnosticReport();
+  const count = getDiagnosticEntries().length;
+
+  useEffect(() => subscribeDiagnostics(() => setRevision((current) => current + 1)), []);
+
+  async function copyReport() {
+    try {
+      await navigator.clipboard.writeText(report);
+      setCopied(true);
+      window.setTimeout(() => setCopied(false), 1_800);
+    } catch (error) {
+      logDiagnostic("diagnostics", "copy-failed", { reason: safeErrorText(error) }, "warn");
+    }
+  }
+
+  async function shareReport() {
+    if (!navigator.share) return;
+    try {
+      await navigator.share({ title: "DirectTalk diagnostics", text: report });
+    } catch {
+      // Closing the native share sheet is not an application error.
+    }
+  }
+
+  return (
+    <div className="diagnostics-backdrop" role="presentation">
+      <section className="diagnostics-panel y2k-window" role="dialog" aria-modal="true" aria-labelledby="diagnostics-title">
+        <WindowTitlebar title={copy.title} onClose={onClose} closeLabel={copy.close} />
+        <div className="diagnostics-body">
+          <div className="diagnostics-heading">
+            <div><h2 id="diagnostics-title">{copy.title}</h2><p>{copy.description}</p></div>
+            <span>{count}</span>
+          </div>
+          <textarea value={report} readOnly spellCheck={false} aria-label={copy.title} onFocus={(event) => event.currentTarget.select()} />
+          <div className="diagnostics-actions">
+            <button type="button" onClick={() => void copyReport()}>{copied ? copy.copied : copy.copy}</button>
+            {Boolean(navigator.share) && <button type="button" onClick={() => void shareReport()}>{copy.share}</button>}
+            <button type="button" onClick={clearDiagnostics}>{copy.clear}</button>
+            <button className="primary-button" type="button" onClick={onClose}>{copy.close}</button>
+          </div>
+        </div>
+      </section>
     </div>
   );
 }
