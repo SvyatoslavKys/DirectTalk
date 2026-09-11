@@ -83,6 +83,7 @@ export class DirectTalkConnection {
   private peerConnection?: RTCPeerConnection;
   private dataChannel?: RTCDataChannel;
   private localHandshakePromise?: Promise<LocalHandshake>;
+  private helloSendPromise?: Promise<void>;
   private remoteHello?: HelloMessage;
   private session?: DerivedSession;
   private sentHello = false;
@@ -371,11 +372,21 @@ export class DirectTalkConnection {
     else await peerConnection.addIceCandidate(candidate);
   }
 
-  private async sendHello(): Promise<void> {
-    if (this.sentHello || this.dataChannel?.readyState !== "open") return;
+  private sendHello(): Promise<void> {
+    if (this.sentHello) return Promise.resolve();
+    if (this.helloSendPromise) return this.helloSendPromise;
+    if (this.dataChannel?.readyState !== "open") return Promise.resolve();
+
+    this.helloSendPromise = this.prepareAndSendHello();
+    return this.helloSendPromise;
+  }
+
+  private async prepareAndSendHello(): Promise<void> {
     this.trace("handshake-hello-preparing");
     const local = await this.getLocalHandshake();
-    this.dataChannel.send(JSON.stringify(await sealHelloMessage(local.hello, this.options.inviteSecret)));
+    const wire = JSON.stringify(await sealHelloMessage(local.hello, this.options.inviteSecret));
+    if (this.dataChannel?.readyState !== "open") throw new Error("Прямое соединение закрыто во время handshake");
+    this.dataChannel.send(wire);
     this.sentHello = true;
     this.trace("handshake-hello-sent");
   }
@@ -473,6 +484,7 @@ export class DirectTalkConnection {
     this.dataChannel = undefined;
     this.peerConnection = undefined;
     this.localHandshakePromise = undefined;
+    this.helloSendPromise = undefined;
     this.remoteHello = undefined;
     this.session = undefined;
     this.sentHello = false;

@@ -1,8 +1,33 @@
-import { describe, expect, it } from "vitest";
-import { parseAppPayload } from "./connection";
+import { describe, expect, it, vi } from "vitest";
+import { base64UrlEncode, randomBytes } from "./encoding";
+import { DirectTalkConnection, parseAppPayload } from "./connection";
 import { MAX_PHOTO_BYTES, photoChunkCount } from "./photos";
+import { createIdentityKeys } from "./protocol";
 
 const id = "123e4567-e89b-42d3-a456-426614174000";
+
+describe("connection handshake", () => {
+  it("sends only one hello when concurrent handshake paths race", async () => {
+    const send = vi.fn();
+    const connection = new DirectTalkConnection({
+      roomId: base64UrlEncode(randomBytes(16)),
+      inviteSecret: randomBytes(32),
+      role: "creator",
+      identity: await createIdentityKeys(),
+      displayName: "Alice",
+      onState: vi.fn(),
+      onSecure: vi.fn(),
+      onPayload: vi.fn(),
+      onError: vi.fn(),
+    });
+    Object.assign(connection, { dataChannel: { readyState: "open", send } });
+    const internal = connection as unknown as { sendHello: () => Promise<void> };
+
+    await Promise.all([internal.sendHello(), internal.sendHello()]);
+
+    expect(send).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("photo packet validation", () => {
   it("accepts a consistent photo offer", () => {
