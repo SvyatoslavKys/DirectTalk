@@ -41,9 +41,14 @@ export async function rtcConfiguration(): Promise<RTCConfiguration> {
       return createRtcConfiguration(fallback);
     }
 
-    const iceServers = parseIceServers(await response.json());
+    const turnResponse = parseTurnResponse(await response.json());
+    const { iceServers } = turnResponse;
     if (!iceServers.some(hasTurnUrl)) throw new Error("TURN response does not contain a relay server");
-    logDiagnostic("turn", "credentials-ready", { serverCount: iceServers.length, relayEnabled: true });
+    logDiagnostic("turn", "credentials-ready", {
+      provider: turnResponse.provider,
+      serverCount: iceServers.length,
+      relayEnabled: true,
+    });
     return createRtcConfiguration(iceServers);
   } catch (error) {
     logDiagnostic("turn", "credentials-failed", { reason: safeErrorText(error) }, "warn");
@@ -59,14 +64,15 @@ function isLocalDevelopment(): boolean {
   return window.location.hostname === "127.0.0.1" || window.location.hostname === "localhost";
 }
 
-function parseIceServers(value: unknown): RTCIceServer[] {
+function parseTurnResponse(value: unknown): { iceServers: RTCIceServer[]; provider: string } {
   if (!value || typeof value !== "object") throw new Error("Invalid TURN response");
-  const rawServers = (value as { iceServers?: unknown }).iceServers;
+  const payload = value as { iceServers?: unknown; provider?: unknown };
+  const rawServers = payload.iceServers;
   if (!Array.isArray(rawServers) || rawServers.length < 1 || rawServers.length > 12) {
     throw new Error("Invalid TURN server list");
   }
 
-  return rawServers.map((raw): RTCIceServer => {
+  const iceServers = rawServers.map((raw): RTCIceServer => {
     if (!raw || typeof raw !== "object") throw new Error("Invalid TURN server");
     const server = raw as Record<string, unknown>;
     const urls = parseIceUrls(server.urls);
@@ -81,6 +87,8 @@ function parseIceServers(value: unknown): RTCIceServer[] {
     }
     return result;
   });
+  const provider = payload.provider === "metered" || payload.provider === "cloudflare" ? payload.provider : "unknown";
+  return { iceServers, provider };
 }
 
 function parseIceUrls(value: unknown): string | string[] {

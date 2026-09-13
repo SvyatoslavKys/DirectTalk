@@ -4,6 +4,8 @@ import Redis from "ioredis";
 const CLOUDFLARE_ENDPOINT = "https://rtc.live.cloudflare.com/v1/turn/keys";
 const RATE_LIMIT_WINDOW_SECONDS = 60 * 60;
 const RATE_LIMIT_REQUESTS = 24;
+const PROVIDER_DEADLINE_MS = 8_000;
+const PROVIDER_REQUEST_TIMEOUT_MS = 5_000;
 const DEFAULT_CREDENTIAL_TTL_SECONDS = 6 * 60 * 60;
 const MIN_CREDENTIAL_TTL_SECONDS = 10 * 60;
 const MAX_CREDENTIAL_TTL_SECONDS = 12 * 60 * 60;
@@ -20,35 +22,120 @@ export default async function handler(request, response) {
   }
   if (!isSameOrigin(request)) return sendJson(response, 403, { error: "origin-not-allowed" });
 
-  const keyId = process.env.CLOUDFLARE_TURN_KEY_ID?.trim();
-  const apiToken = process.env.CLOUDFLARE_TURN_API_TOKEN?.trim();
-  if (!keyId || !apiToken) return sendJson(response, 503, { error: "turn-not-configured" });
+  let providers;
+  try {
+    providers = configuredProviders();
+  } catch {
+    return sendJson(response, 503, { error: "turn-invalid-configuration" });
+  }
+  if (!providers.length) return sendJson(response, 503, { error: "turn-not-configured" });
 
   try {
-    const allowed = await consumeRateLimit(request, apiToken);
+    const allowed = await consumeRateLimit(request, providers[0].rateLimitSecret);
     if (!allowed) return sendJson(response, 429, { error: "rate-limit-exceeded" });
 
-    const ttl = credentialTtlSeconds();
-    const cloudflareResponse = await fetch(
-      `${CLOUDFLARE_ENDPOINT}/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`,
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${apiToken}`,
-          "Content-Type": "application/json",
-        },
-        body: JSON.stringify({ ttl }),
-        signal: AbortSignal.timeout(8_000),
-      },
-    );
-
-    if (!cloudflareResponse.ok) return sendJson(response, 502, { error: "turn-provider-unavailable" });
-    const iceServers = sanitizeIceServers((await cloudflareResponse.json()).iceServers);
-    if (!iceServers.some(hasTurnUrl)) return sendJson(response, 502, { error: "turn-provider-invalid-response" });
-    return sendJson(response, 200, { iceServers, ttl });
+    const deadline = Date.now() + PROVIDER_DEADLINE_MS;
+    for (const provider of providers) {
+      try {
+        const remaining = deadline - Date.now();
+        if (remaining <= 0) break;
+        const result = await provider.credentials(Math.min(PROVIDER_REQUEST_TIMEOUT_MS, remaining));
+        const iceServers = sanitizeIceServers(result.iceServers);
+        if (!iceServers.some(hasTurnUrl)) throw new Error("TURN response has no relay server");
+        return sendJson(response, 200, {
+          iceServers,
+          provider: provider.name,
+          ...(result.ttl ? { ttl: result.ttl } : {}),
+        });
+      } catch {
+        // Try the next configured provider without logging credentials or response bodies.
+      }
+    }
+    return sendJson(response, 502, { error: "turn-provider-unavailable" });
   } catch {
     return sendJson(response, 503, { error: "turn-temporarily-unavailable" });
   }
+}
+
+function configuredProviders() {
+  const providers = [];
+  const meteredUrl = process.env.METERED_TURN_CREDENTIALS_URL?.trim();
+  const meteredApiKey = process.env.METERED_TURN_API_KEY?.trim();
+  if (meteredUrl || meteredApiKey) {
+    if (!meteredUrl || !meteredApiKey) throw new Error("Incomplete Metered TURN configuration");
+    const credentialsUrl = validateMeteredCredentialsUrl(meteredUrl);
+    providers.push({
+      name: "metered",
+      rateLimitSecret: meteredApiKey,
+      credentials: (timeout) => fetchMeteredCredentials(credentialsUrl, meteredApiKey, timeout),
+    });
+  }
+
+  const cloudflareKeyId = process.env.CLOUDFLARE_TURN_KEY_ID?.trim();
+  const cloudflareApiToken = process.env.CLOUDFLARE_TURN_API_TOKEN?.trim();
+  if (cloudflareKeyId || cloudflareApiToken) {
+    if (!cloudflareKeyId || !cloudflareApiToken) throw new Error("Incomplete Cloudflare TURN configuration");
+    providers.push({
+      name: "cloudflare",
+      rateLimitSecret: cloudflareApiToken,
+      credentials: (timeout) => fetchCloudflareCredentials(cloudflareKeyId, cloudflareApiToken, timeout),
+    });
+  }
+
+  return providers;
+}
+
+async function fetchMeteredCredentials(credentialsUrl, apiKey, timeout) {
+  const url = new URL(credentialsUrl);
+  url.searchParams.set("apiKey", apiKey);
+  const providerResponse = await fetch(url, {
+    method: "GET",
+    headers: { Accept: "application/json" },
+    signal: AbortSignal.timeout(timeout),
+  });
+  if (!providerResponse.ok) throw new Error("Metered TURN unavailable");
+  return { iceServers: extractIceServers(await providerResponse.json()) };
+}
+
+async function fetchCloudflareCredentials(keyId, apiToken, timeout) {
+  const ttl = credentialTtlSeconds();
+  const providerResponse = await fetch(
+    `${CLOUDFLARE_ENDPOINT}/${encodeURIComponent(keyId)}/credentials/generate-ice-servers`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${apiToken}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ ttl }),
+      signal: AbortSignal.timeout(timeout),
+    },
+  );
+  if (!providerResponse.ok) throw new Error("Cloudflare TURN unavailable");
+  return { iceServers: extractIceServers(await providerResponse.json()), ttl };
+}
+
+function extractIceServers(payload) {
+  return Array.isArray(payload) ? payload : payload?.iceServers;
+}
+
+function validateMeteredCredentialsUrl(value) {
+  const url = new URL(value);
+  const path = url.pathname.replace(/\/$/u, "");
+  if (
+    url.protocol !== "https:" ||
+    !url.hostname.endsWith(".metered.live") ||
+    url.hostname === "metered.live" ||
+    path !== "/api/v1/turn/credentials" ||
+    url.username ||
+    url.password ||
+    url.search ||
+    url.hash
+  ) {
+    throw new Error("Invalid Metered TURN credentials URL");
+  }
+  url.pathname = path;
+  return url.toString();
 }
 
 function setSecurityHeaders(response) {
@@ -79,12 +166,12 @@ function firstHeaderValue(value) {
   return typeof value === "string" ? value.split(",")[0].trim() : "";
 }
 
-async function consumeRateLimit(request, apiToken) {
+async function consumeRateLimit(request, providerSecret) {
   const redisUrl = process.env.REDIS_URL?.trim();
   if (!redisUrl) return false;
   redis ??= createRedis(redisUrl);
   const address = firstHeaderValue(request.headers["x-forwarded-for"]) || request.socket?.remoteAddress || "unknown";
-  const digest = createHmac("sha256", process.env.TURN_RATE_LIMIT_SECRET?.trim() || apiToken)
+  const digest = createHmac("sha256", process.env.TURN_RATE_LIMIT_SECRET?.trim() || providerSecret)
     .update(address)
     .digest("hex")
     .slice(0, 32);
@@ -149,3 +236,5 @@ function hasTurnUrl(server) {
   const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
   return urls.some((url) => /^(?:turn|turns):/iu.test(url));
 }
+
+export { extractIceServers, sanitizeIceServers, validateMeteredCredentialsUrl };
