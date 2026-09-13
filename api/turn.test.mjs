@@ -1,5 +1,11 @@
+import { createHmac } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { extractIceServers, sanitizeIceServers, validateMeteredCredentialsUrl } from "./turn.mjs";
+import {
+  createOpenRelayTestCredentials,
+  extractIceServers,
+  sanitizeIceServers,
+  validateMeteredCredentialsUrl,
+} from "./turn.mjs";
 
 const meteredServers = [
   { urls: "stun:stun.relay.metered.ca:80" },
@@ -31,5 +37,17 @@ describe("Metered TURN response handling", () => {
     expect(() => validateMeteredCredentialsUrl("https://example.com/api/v1/turn/credentials")).toThrow(
       "Invalid Metered TURN credentials URL",
     );
+  });
+
+  it("creates one-hour credentials for the official public static-auth test relay", () => {
+    const result = createOpenRelayTestCredentials(1_700_000_000);
+    const turnServer = result.iceServers[1];
+    expect(result.ttl).toBe(3_600);
+    expect(turnServer.username).toBe("1700003600");
+    expect(turnServer.credential).toBe(
+      createHmac("sha1", "openrelayprojectsecret").update("1700003600").digest("base64"),
+    );
+    expect(turnServer.urls).toContain("turn:staticauth.openrelay.metered.ca:80?transport=udp");
+    expect(turnServer.urls).toContain("turns:staticauth.openrelay.metered.ca:443?transport=tcp");
   });
 });

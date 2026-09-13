@@ -108,6 +108,7 @@ Production deployments should also:
 - use an exact origin allowlist;
 - use Redis only for short-lived signaling coordination and disable persistence/diagnostic logging where the provider allows it;
 - keep the long-lived Metered API key (and any optional Cloudflare fallback key) exclusively in server-side environment variables; expose only provider-issued TURN credentials to browsers;
+- treat the built-in Metered Open Relay static-auth provider as a public testing fallback only; its shared secret is published by Metered and must not be treated as private infrastructure or a production availability guarantee;
 - protect the TURN credential endpoint with an exact same-origin check, no-store responses, strict response validation, and Redis-backed request rate limiting;
 - avoid third-party JavaScript, CDN-hosted fonts, analytics, and error trackers that could access application data;
 - publish reproducible builds and release hashes once a release process exists.

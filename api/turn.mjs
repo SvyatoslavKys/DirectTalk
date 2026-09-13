@@ -6,6 +6,9 @@ const RATE_LIMIT_WINDOW_SECONDS = 60 * 60;
 const RATE_LIMIT_REQUESTS = 24;
 const PROVIDER_DEADLINE_MS = 8_000;
 const PROVIDER_REQUEST_TIMEOUT_MS = 5_000;
+const OPEN_RELAY_STATIC_AUTH_HOST = "staticauth.openrelay.metered.ca";
+const OPEN_RELAY_STATIC_AUTH_SECRET = "openrelayprojectsecret";
+const OPEN_RELAY_TEST_TTL_SECONDS = 60 * 60;
 const DEFAULT_CREDENTIAL_TTL_SECONDS = 6 * 60 * 60;
 const MIN_CREDENTIAL_TTL_SECONDS = 10 * 60;
 const MAX_CREDENTIAL_TTL_SECONDS = 12 * 60 * 60;
@@ -82,7 +85,40 @@ function configuredProviders() {
     });
   }
 
+  if (!providers.length) {
+    providers.push({
+      name: "open-relay-test",
+      rateLimitSecret:
+        process.env.TURN_RATE_LIMIT_SECRET?.trim() ||
+        process.env.REDIS_URL?.trim() ||
+        OPEN_RELAY_STATIC_AUTH_SECRET,
+      credentials: () => createOpenRelayTestCredentials(),
+    });
+  }
+
   return providers;
+}
+
+function createOpenRelayTestCredentials(nowSeconds = Math.floor(Date.now() / 1_000)) {
+  const expiresAt = nowSeconds + OPEN_RELAY_TEST_TTL_SECONDS;
+  const username = String(expiresAt);
+  const credential = createHmac("sha1", OPEN_RELAY_STATIC_AUTH_SECRET).update(username).digest("base64");
+  return {
+    ttl: OPEN_RELAY_TEST_TTL_SECONDS,
+    iceServers: [
+      { urls: "stun:stun.relay.metered.ca:80" },
+      {
+        urls: [
+          `turn:${OPEN_RELAY_STATIC_AUTH_HOST}:80?transport=udp`,
+          `turn:${OPEN_RELAY_STATIC_AUTH_HOST}:80?transport=tcp`,
+          `turn:${OPEN_RELAY_STATIC_AUTH_HOST}:443?transport=tcp`,
+          `turns:${OPEN_RELAY_STATIC_AUTH_HOST}:443?transport=tcp`,
+        ],
+        username,
+        credential,
+      },
+    ],
+  };
 }
 
 async function fetchMeteredCredentials(credentialsUrl, apiKey, timeout) {
@@ -237,4 +273,4 @@ function hasTurnUrl(server) {
   return urls.some((url) => /^(?:turn|turns):/iu.test(url));
 }
 
-export { extractIceServers, sanitizeIceServers, validateMeteredCredentialsUrl };
+export { createOpenRelayTestCredentials, extractIceServers, sanitizeIceServers, validateMeteredCredentialsUrl };

@@ -26,7 +26,7 @@ DirectTalk deploys as one Vercel project:
 
 - Vite builds the React frontend and Vercel serves it over HTTPS;
 - `api/signal.mjs` exposes the same-origin WebSocket endpoint at `/api/signal`;
-- `api/turn.mjs` obtains Metered TURN credentials without exposing the long-lived Metered API key to the browser;
+- `api/turn.mjs` obtains Metered TURN credentials without exposing the long-lived Metered API key to the browser; until a private provider is configured, it generates short-lived credentials for Metered's officially published Open Relay static-auth test service;
 - the signaling backend relays only SDP and ICE while the connection is being established;
 - once the encrypted DataChannel handshake succeeds, both browsers close their signaling WebSockets and continue peer to peer;
 - Redis Cloud coordinates signaling sockets that land on different Vercel Function instances and rate-limits TURN credential requests using a keyed hash of the client address. It never stores messages, photos, names, encryption keys, raw IP addresses, or TURN secrets.
@@ -38,7 +38,7 @@ Vercel WebSocket Functions have a maximum lifetime. Before WebRTC is ready, the 
 1. Push this directory to a GitHub repository.
 2. In Vercel, create a project and import that repository. Vercel reads `vercel.json`; no build-setting changes are required.
 3. In the Vercel Marketplace, add **Redis Cloud** to this project and make sure it creates a `REDIS_URL` environment variable for Production and Preview.
-4. Create a free Metered Open Relay app/API key. Add its endpoint without the `apiKey` query parameter as `METERED_TURN_CREDENTIALS_URL` (for example, `https://your-app.metered.live/api/v1/turn/credentials`) and add the key as the sensitive `METERED_TURN_API_KEY`. Enable both for Production and Preview. These are server-side variables: never add `VITE_` to their names.
+4. For testing, no TURN provider variables are required: DirectTalk uses Metered's public Open Relay static-auth service. Before production, create a private Metered app/API key, add its endpoint without the `apiKey` query parameter as `METERED_TURN_CREDENTIALS_URL` (for example, `https://your-app.metered.live/api/v1/turn/credentials`), and add the key as the sensitive `METERED_TURN_API_KEY`. Enable both for Production and Preview. These are server-side variables: never add `VITE_` to their names.
 5. Optionally add Cloudflare Realtime TURN as a secondary provider through `CLOUDFLARE_TURN_KEY_ID` and `CLOUDFLARE_TURN_API_TOKEN`. When both providers exist, Metered is tried first.
 6. Optionally add a random server-side `TURN_RATE_LIMIT_SECRET`. The endpoint otherwise uses the primary provider secret as its HMAC key when storing an irreversible per-client rate-limit identifier in Redis.
 7. Do not add `VITE_SIGNALING_URL` in Vercel. The browser automatically connects to `wss://<your-domain>/api/signal` on the same origin.
@@ -61,7 +61,7 @@ SIGNAL_TEST_ORIGIN=https://your-domain.example \
 npm run test:signal
 ```
 
-WebSockets on Vercel are currently a Public Beta. DirectTalk requests short-lived TURN credentials before creating the peer connection and falls back to STUN-only mode if the endpoint is not configured or temporarily unavailable. The fallback can still fail between restrictive networks, which is reported in Diagnostics.
+WebSockets on Vercel are currently a Public Beta. DirectTalk requests short-lived TURN credentials before creating the peer connection. Without private provider variables, the endpoint uses Metered's public static-auth Open Relay service for testing. If the endpoint or relay is unavailable, the browser falls back to STUN-only mode, which can still fail between restrictive networks and is reported in Diagnostics.
 
 ## Local development
 
@@ -103,6 +103,8 @@ See `.env.example` for an example configuration.
 - `CLOUDFLARE_TURN_API_TOKEN` — optional Cloudflare key secret for fallback; mark it sensitive in Vercel.
 - `TURN_CREDENTIAL_TTL_SECONDS` — optional Cloudflare credential lifetime; defaults to 21,600 seconds and is clamped to 10 minutes–12 hours.
 - `TURN_RATE_LIMIT_SECRET` — optional independent HMAC secret for privacy-preserving per-client TURN request rate limiting.
+
+The built-in `open-relay-test` provider uses Metered's publicly documented shared static-auth service. It is intended only for testing and has no private capacity or availability guarantee. Configure the two `METERED_TURN_*` variables before treating the deployment as production-ready; DirectTalk then disables the public test provider automatically.
 
 Never place a long-lived TURN secret in a `VITE_*` variable: everything with that prefix is included in the client-side JavaScript. A production service should issue short-lived TURN credentials to the browser from a server-side endpoint.
 
