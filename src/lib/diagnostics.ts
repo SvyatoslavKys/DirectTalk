@@ -20,17 +20,21 @@ const listeners = new Set<DiagnosticListener>();
 let entries = readStoredEntries();
 let nextId = (entries.at(-1)?.id ?? 0) + 1;
 let initialized = false;
+let started = false;
 
 export function initializeDiagnostics(): () => void {
   if (initialized) return () => undefined;
   initialized = true;
 
-  logDiagnostic("app", "started", {
-    version: APP_VERSION,
-    secureContext: window.isSecureContext,
-    online: navigator.onLine,
-    visibility: document.visibilityState,
-  });
+  if (!started) {
+    started = true;
+    logDiagnostic("app", "started", {
+      version: APP_VERSION,
+      secureContext: window.isSecureContext,
+      online: navigator.onLine,
+      visibility: document.visibilityState,
+    });
+  }
 
   const onError = (event: ErrorEvent) => {
     logDiagnostic("browser", "uncaught-error", { reason: safeErrorText(event.error ?? event.message) }, "error");
@@ -95,7 +99,6 @@ export function clearDiagnostics(): void {
   entries = [];
   persistEntries();
   listeners.forEach((listener) => listener());
-  logDiagnostic("diagnostics", "cleared");
 }
 
 export function formatDiagnosticReport(): string {
@@ -105,8 +108,8 @@ export function formatDiagnosticReport(): string {
     "format=1",
     `generated=${new Date().toISOString()}`,
     `app=${APP_VERSION}`,
-    `origin=${window.location.origin}`,
-    `path=${window.location.pathname}`,
+    `origin=${diagnosticOrigin()}`,
+    `path=${safeErrorText(window.location.pathname, 260)}`,
     `browser=${safeErrorText(navigator.userAgent, 260)}`,
     `language=${navigator.language}`,
     `online=${navigator.onLine}`,
@@ -130,9 +133,27 @@ export function safeErrorText(reason: unknown, maxLength = 180): string {
   return raw
     .replace(/https?:\/\/\S+/giu, "[url]")
     .replace(/\b(?:\d{1,3}\.){3}\d{1,3}\b/gu, "[ip]")
+    .replace(/\[(?:[a-f0-9]{0,4}:){2,}[a-f0-9:.]{0,45}\]/giu, "[ip]")
+    .replace(/\b(?:[a-f0-9]{1,4}:){2,7}[a-f0-9]{1,4}\b/giu, "[ip]")
+    .replace(/\b(?:[a-f0-9]{1,4}:){1,7}:[a-f0-9]{0,4}\b/giu, "[ip]")
     .replace(/\b[A-Za-z0-9_-]{32,}\b/gu, "[redacted]")
     .replace(/[\r\n\t]+/gu, " ")
     .slice(0, maxLength);
+}
+
+function diagnosticOrigin(): string {
+  try {
+    const { protocol, hostname, port } = window.location;
+    const safeHostname = isIpHostname(hostname) ? "[ip]" : hostname;
+    return `${protocol}//${safeHostname}${port ? `:${port}` : ""}`;
+  } catch {
+    return "unavailable";
+  }
+}
+
+function isIpHostname(hostname: string): boolean {
+  const value = hostname.replace(/^\[|\]$/gu, "");
+  return value.includes(":") || /^(?:\d{1,3}\.){3}\d{1,3}$/u.test(value);
 }
 
 function sanitizeDetails(details?: DiagnosticDetails): Record<string, string | number | boolean | null> | undefined {

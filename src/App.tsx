@@ -1261,6 +1261,7 @@ export default function App() {
             <span><b>☺</b> {t("home.emoji")}</span>
             <span><b>✓</b> {t("home.statuses")}</span>
             <span><b>▧</b> {t("home.photos")}</span>
+            <span className="app-version" title={`DirectTalk ${APP_VERSION}`}>v{APP_VERSION}</span>
           </div>
         </section>
       )}
@@ -1578,14 +1579,30 @@ function DiagnosticsPanel({ language, onClose }: { language: Language; onClose: 
   const copy = diagnosticsCopy[language];
   const [, setRevision] = useState(0);
   const [copied, setCopied] = useState(false);
+  const reportRef = useRef<HTMLTextAreaElement | null>(null);
   const report = formatDiagnosticReport();
   const count = getDiagnosticEntries().length;
 
   useEffect(() => subscribeDiagnostics(() => setRevision((current) => current + 1)), []);
+  useEffect(() => {
+    const handleKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", handleKeyDown);
+    return () => document.removeEventListener("keydown", handleKeyDown);
+  }, [onClose]);
 
   async function copyReport() {
     try {
-      await navigator.clipboard.writeText(report);
+      if (navigator.clipboard?.writeText) {
+        try {
+          await navigator.clipboard.writeText(report);
+        } catch (error) {
+          if (!copyReportFromTextarea()) throw error;
+        }
+      } else if (!copyReportFromTextarea()) {
+        throw new Error("Clipboard API is unavailable");
+      }
       setCopied(true);
       window.setTimeout(() => setCopied(false), 1_800);
     } catch (error) {
@@ -1593,17 +1610,33 @@ function DiagnosticsPanel({ language, onClose }: { language: Language; onClose: 
     }
   }
 
+  function copyReportFromTextarea(): boolean {
+    const textarea = reportRef.current;
+    if (!textarea) return false;
+    textarea.focus();
+    textarea.select();
+    try {
+      return document.execCommand("copy");
+    } catch {
+      return false;
+    }
+  }
+
   async function shareReport() {
     if (!navigator.share) return;
     try {
       await navigator.share({ title: "DirectTalk diagnostics", text: report });
-    } catch {
-      // Closing the native share sheet is not an application error.
+    } catch (error) {
+      if (!(error instanceof DOMException && error.name === "AbortError")) {
+        logDiagnostic("diagnostics", "share-failed", { reason: safeErrorText(error) }, "warn");
+      }
     }
   }
 
   return (
-    <div className="diagnostics-backdrop" role="presentation">
+    <div className="diagnostics-backdrop" role="presentation" onMouseDown={(event) => {
+      if (event.target === event.currentTarget) onClose();
+    }}>
       <section className="diagnostics-panel y2k-window" role="dialog" aria-modal="true" aria-labelledby="diagnostics-title">
         <WindowTitlebar title={copy.title} onClose={onClose} closeLabel={copy.close} />
         <div className="diagnostics-body">
@@ -1611,7 +1644,7 @@ function DiagnosticsPanel({ language, onClose }: { language: Language; onClose: 
             <div><h2 id="diagnostics-title">{copy.title}</h2><p>{copy.description}</p></div>
             <span>{count}</span>
           </div>
-          <textarea value={report} readOnly spellCheck={false} aria-label={copy.title} onFocus={(event) => event.currentTarget.select()} />
+          <textarea ref={reportRef} value={report} readOnly spellCheck={false} aria-label={copy.title} onFocus={(event) => event.currentTarget.select()} />
           <div className="diagnostics-actions">
             <button type="button" onClick={() => void copyReport()}>{copied ? copy.copied : copy.copy}</button>
             {Boolean(navigator.share) && <button type="button" onClick={() => void shareReport()}>{copy.share}</button>}
