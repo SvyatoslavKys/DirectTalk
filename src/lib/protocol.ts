@@ -315,7 +315,7 @@ export class SessionCipher {
     }
 
     const sequence = BigInt(wire.sequence);
-    if (sequence !== this.receiveSequence) throw new Error("Нарушена последовательность защищённых пакетов");
+    if (sequence < this.receiveSequence) throw new Error("Нарушена последовательность защищённых пакетов");
     const plaintext = await crypto.subtle.decrypt(
       {
         name: "AES-GCM",
@@ -326,7 +326,7 @@ export class SessionCipher {
       this.receiveKey,
       base64UrlDecode(wire.ciphertext),
     );
-    this.receiveSequence += 1n;
+    this.receiveSequence = sequence + 1n;
     return JSON.parse(fromUtf8(plaintext));
   }
 }

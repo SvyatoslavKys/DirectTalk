@@ -43,7 +43,7 @@ Vercel WebSocket Functions have a maximum lifetime. Before WebRTC is ready, the 
 6. Optionally add a random server-side `TURN_RATE_LIMIT_SECRET`. The endpoint otherwise uses the primary provider secret as its HMAC key when storing an irreversible per-client rate-limit identifier in Redis.
 7. Do not add `VITE_SIGNALING_URL` in Vercel. The browser automatically connects to `wss://<your-domain>/api/signal` on the same origin.
 8. Redeploy after adding the variables, then open `https://<your-domain>/api/signal`. A configured deployment returns JSON with `"status":"ok"`, `"sharedBroker":true`, and `"storesMessages":false`.
-9. Open the app on two different devices. Create an invitation on the first device and open it on the second. In Diagnostics, a working configuration shows `turn credentials-ready` with `"provider":"metered"` and `relayEnabled:true`. A restrictive-network connection should also produce at least one ICE entry with `"iceType":"relay"`.
+9. Open the app on two different devices. Create an invitation on the first device and open it on the second. In Diagnostics, a working configuration shows `turn credentials-ready` with `"provider":"metered"` and `relayConfigured:true`. A restrictive-network connection should also produce at least one ICE entry with `"iceType":"relay"`.
 
 Always test invitations on the stable production domain, not a temporary Vercel deployment URL. Set `VITE_PUBLIC_APP_URL` if the production domain is different from `https://direct-talk.vercel.app`.
 
@@ -51,7 +51,7 @@ Always test invitations on the stable production domain, not a temporary Vercel 
 
 The in-app **Diagnostics** button opens a mobile-friendly technical log. On a narrow screen it is shown as an `i` button in the top bar. The error screen also links directly to this panel.
 
-The report records connection stages, signaling and WebRTC state changes, DataChannel state, and the encrypted-handshake stage. Use **Share logs** on a phone or **Copy logs** on desktop. It intentionally excludes message text, files, cryptographic keys, invitation secrets, SDP, ICE candidate values, and IP addresses. It records only the non-sensitive ICE route class (`host`, `srflx`, `prflx`, or `relay`). The log survives a normal reload in the same tab through `sessionStorage`, but a browser process crash may still remove it.
+The report records connection stages, signaling and WebRTC state changes, DataChannel state, encrypted-handshake stages, ICE recovery attempts, and an anonymized summary of the selected route. Use **Share logs** on a phone or **Copy logs** on desktop. It intentionally excludes message text, files, cryptographic keys, invitation secrets, SDP, ICE candidate values, IP addresses, ports, and exact encrypted-message sizes. It records only route classes (`host`, `srflx`, `prflx`, or `relay`), transport type, bucketed buffer and traffic sizes, packet counters, and rounded timing. The log survives a normal reload in the same tab through `sessionStorage`, but a browser process crash may still remove it.
 
 To test the deployed signaling endpoint from a terminal:
 
@@ -63,9 +63,11 @@ npm run test:signal
 
 WebSockets on Vercel are currently a Public Beta. DirectTalk requests short-lived TURN credentials before creating the peer connection. Without private provider variables, the endpoint uses Metered's public static-auth Open Relay service for testing. If the endpoint or relay is unavailable, the browser falls back to STUN-only mode, which can still fail between restrictive networks and is reported in Diagnostics.
 
+DirectTalk exchanges explicit end-of-candidates markers before releasing signaling. If an established route is briefly lost, both browsers preserve the encrypted DataChannel, reopen signaling when needed, and make up to two bounded ICE-restart attempts before reporting a fatal connection error.
+
 ## Local development
 
-Node.js 22 or later is required.
+Node.js 22.x is required.
 
 ```bash
 npm install

@@ -382,10 +382,19 @@ function withinRateLimit(context) {
 function isRoomId(value) { return typeof value === "string" && /^[A-Za-z0-9_-]{22}$/.test(value); }
 function isRole(value) { return value === "creator" || value === "joiner"; }
 
-function isSignalPayload(payload) {
+export function isSignalPayload(payload) {
   if (!payload || typeof payload !== "object" || Array.isArray(payload)) return false;
   const keys = Object.keys(payload);
-  if (keys.length !== 1) return false;
+  if (keys.length < 1 || keys.length > 2 || keys.some((key) => key !== "description" && key !== "candidate" && key !== "iceGeneration")) {
+    return false;
+  }
+  if (
+    "iceGeneration" in payload &&
+    (typeof payload.iceGeneration !== "string" || !/^[A-Za-z0-9_-]{16}$/u.test(payload.iceGeneration))
+  ) {
+    return false;
+  }
+  if (("description" in payload) === ("candidate" in payload)) return false;
 
   if ("description" in payload) {
     const description = payload.description;

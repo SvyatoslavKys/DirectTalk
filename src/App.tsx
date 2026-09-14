@@ -174,6 +174,7 @@ export default function App() {
   const cancelledPhotosRef = useRef(new Set<string>());
   const pendingDeleteIdsRef = useRef(new Set<string>());
   const pendingDeleteTimersRef = useRef(new Map<string, number>());
+  const pendingDeliveryTimersRef = useRef(new Map<string, number>());
   const incomingClearRequestRef = useRef<string | null>(null);
   const pendingClearRequestRef = useRef<string | null>(null);
   const pendingClearTimerRef = useRef<number | null>(null);
@@ -210,6 +211,7 @@ export default function App() {
   useEffect(() => () => {
     connectionRef.current?.close();
     for (const timer of pendingDeleteTimersRef.current.values()) window.clearTimeout(timer);
+    for (const timer of pendingDeliveryTimersRef.current.values()) window.clearTimeout(timer);
     if (pendingClearTimerRef.current !== null) window.clearTimeout(pendingClearTimerRef.current);
   }, []);
 
@@ -379,6 +381,7 @@ export default function App() {
       const existing = await db.messages.get(payload.id);
       if (existing) {
         if (existing.sender === "peer") {
+          logDiagnostic("chat", "incoming-message-duplicate", { status: existing.status });
           await acknowledgeMessage(connection, existing.id, existing.status === "read" ? "read" : "delivered");
         }
         return;
@@ -394,6 +397,7 @@ export default function App() {
       };
       await db.messages.put(message);
       setMessages((current) => upsertMessage(current, message));
+      logDiagnostic("chat", "incoming-message-stored", { status });
       await acknowledgeMessage(connection, message.id, status);
       return;
     }
@@ -403,11 +407,13 @@ export default function App() {
       if (!outgoing || outgoing.sender !== "me" || outgoing.status === "failed") return;
       const nextStatus = outgoing.status === "read" ? "read" : payload.status;
       await db.messages.update(payload.messageId, { status: nextStatus });
+      finishDeliveryWatch(payload.messageId);
       setMessages((current) =>
         current.map((message) =>
           message.id === payload.messageId && message.sender === "me" ? { ...message, status: nextStatus } : message,
         ),
       );
+      logDiagnostic("chat", "delivery-confirmed", { status: nextStatus });
       return;
     }
 
@@ -703,8 +709,10 @@ export default function App() {
     setMessages((current) => upsertMessage(current, message));
     try {
       await connection.send({ kind: "chat-message", id: message.id, text: message.text, createdAt: message.createdAt });
-      logDiagnostic("chat", "message-sent");
+      logDiagnostic("chat", "message-queued");
+      beginDeliveryWatch(message.id);
     } catch (reason) {
+      finishDeliveryWatch(message.id);
       await db.messages.update(message.id, { status: "failed" });
       setMessages((current) => current.map((item) => (item.id === message.id ? { ...item, status: "failed" } : item)));
       setError(reason instanceof Error ? reason.message : t("error.messageSend"));
@@ -934,6 +942,30 @@ export default function App() {
     setPendingDeleteIds(new Set());
   }
 
+  function beginDeliveryWatch(messageId: string) {
+    finishDeliveryWatch(messageId);
+    const timer = window.setTimeout(() => {
+      pendingDeliveryTimersRef.current.delete(messageId);
+      void db.messages.get(messageId).then((message) => {
+        if (message?.sender === "me" && message.status === "sending") {
+          logDiagnostic("chat", "delivery-still-pending", { durationMs: 8_000 }, "warn");
+        }
+      }).catch(handleLocalError);
+    }, 8_000);
+    pendingDeliveryTimersRef.current.set(messageId, timer);
+  }
+
+  function finishDeliveryWatch(messageId: string) {
+    const timer = pendingDeliveryTimersRef.current.get(messageId);
+    if (timer !== undefined) window.clearTimeout(timer);
+    pendingDeliveryTimersRef.current.delete(messageId);
+  }
+
+  function clearDeliveryWatches() {
+    for (const timer of pendingDeliveryTimersRef.current.values()) window.clearTimeout(timer);
+    pendingDeliveryTimersRef.current.clear();
+  }
+
   async function clearOnlyThisBrowser() {
     if (!peer) return;
     setShowClearDialog(false);
@@ -1010,6 +1042,7 @@ export default function App() {
     chatGenerationRef.current += 1;
     await cancelAllPhotoTransfers(connection);
     clearPendingDeletes();
+    clearDeliveryWatches();
     setMessageMenuId(null);
     setDeleteConfirmation(null);
     setPhotoError("");
@@ -1116,6 +1149,7 @@ export default function App() {
     incomingPhotosRef.current.clear();
     incomingPhotoOffersRef.current.clear();
     clearPendingDeletes();
+    clearDeliveryWatches();
     finishPendingClearRequest();
     incomingClearRequestRef.current = null;
     setIncomingClearRequest(null);
@@ -1757,6 +1791,7 @@ function LockIcon() {
 
 async function acknowledgeMessage(connection: DirectTalkConnection, messageId: string, status: "delivered" | "read") {
   await connection.send({ kind: "ack", messageId, status });
+  logDiagnostic("chat", "ack-queued", { status });
 }
 
 function upsertMessage(messages: StoredMessage[], message: StoredMessage): StoredMessage[] {

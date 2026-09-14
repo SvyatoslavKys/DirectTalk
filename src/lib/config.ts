@@ -42,12 +42,12 @@ export async function rtcConfiguration(): Promise<RTCConfiguration> {
     }
 
     const turnResponse = parseTurnResponse(await response.json());
-    const { iceServers } = turnResponse;
+    const iceServers = addFallbackIceServers(turnResponse.iceServers, fallback);
     if (!iceServers.some(hasTurnUrl)) throw new Error("TURN response does not contain a relay server");
     logDiagnostic("turn", "credentials-ready", {
       provider: turnResponse.provider,
       serverCount: iceServers.length,
-      relayEnabled: true,
+      relayConfigured: true,
     });
     return createRtcConfiguration(iceServers);
   } catch (error) {
@@ -87,8 +87,23 @@ function parseTurnResponse(value: unknown): { iceServers: RTCIceServer[]; provid
     }
     return result;
   });
-  const provider = payload.provider === "metered" || payload.provider === "cloudflare" ? payload.provider : "unknown";
+  const provider =
+    payload.provider === "metered" || payload.provider === "cloudflare" || payload.provider === "open-relay-test"
+      ? payload.provider
+      : "unknown";
   return { iceServers, provider };
+}
+
+function addFallbackIceServers(iceServers: RTCIceServer[], fallback: RTCIceServer[]): RTCIceServer[] {
+  const configuredUrls = new Set(iceServers.flatMap((server) => iceServerUrls(server)));
+  const missingFallback = fallback.filter((server) =>
+    iceServerUrls(server).some((url) => !configuredUrls.has(url)),
+  );
+  return missingFallback.length ? [...iceServers, ...missingFallback] : iceServers;
+}
+
+function iceServerUrls(server: RTCIceServer): string[] {
+  return typeof server.urls === "string" ? [server.urls] : server.urls;
 }
 
 function parseIceUrls(value: unknown): string | string[] {
@@ -103,8 +118,7 @@ function parseIceUrls(value: unknown): string | string[] {
 }
 
 function hasTurnUrl(server: RTCIceServer): boolean {
-  const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
-  return urls.some((url) => /^(?:turn|turns):/iu.test(url));
+  return iceServerUrls(server).some((url) => /^(?:turn|turns):/iu.test(url));
 }
 
 function validateWebSocketUrl(value: string): string {

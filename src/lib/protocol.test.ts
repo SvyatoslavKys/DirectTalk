@@ -101,4 +101,53 @@ describe("DirectTalk cryptographic handshake", () => {
     await joinerSession.cipher.open(wire);
     await expect(joinerSession.cipher.open(wire)).rejects.toThrow("последовательность");
   });
+
+  it("accepts an authenticated packet after a locally abandoned sequence", async () => {
+    const roomId = base64UrlEncode(randomBytes(16));
+    const secret = randomBytes(32);
+    const [creatorIdentity, joinerIdentity] = await Promise.all([createIdentityKeys(), createIdentityKeys()]);
+    const [creatorLocal, joinerLocal] = await Promise.all([
+      createLocalHandshake(creatorIdentity, roomId, secret, "creator", "Алиса"),
+      createLocalHandshake(joinerIdentity, roomId, secret, "joiner", "Боб"),
+    ]);
+    const [creatorView, joinerView] = await Promise.all([
+      verifyRemoteHello(joinerLocal.hello, roomId, secret, "creator"),
+      verifyRemoteHello(creatorLocal.hello, roomId, secret, "joiner", creatorIdentity.publicKeyRaw),
+    ]);
+    const [creatorSession, joinerSession] = await Promise.all([
+      deriveSession(creatorLocal, creatorView, secret),
+      deriveSession(joinerLocal, joinerView, secret),
+    ]);
+
+    const abandonedWire = JSON.parse(await creatorSession.cipher.seal({ kind: "chat-message", text: "lost" }));
+    const deliveredWire = JSON.parse(await creatorSession.cipher.seal({ kind: "chat-message", text: "delivered" }));
+
+    await expect(joinerSession.cipher.open(deliveredWire)).resolves.toEqual({
+      kind: "chat-message",
+      text: "delivered",
+    });
+    await expect(joinerSession.cipher.open(abandonedWire)).rejects.toThrow("последовательность");
+  });
+
+  it("does not advance replay protection after a forged high sequence fails authentication", async () => {
+    const roomId = base64UrlEncode(randomBytes(16));
+    const secret = randomBytes(32);
+    const [creatorIdentity, joinerIdentity] = await Promise.all([createIdentityKeys(), createIdentityKeys()]);
+    const [creatorLocal, joinerLocal] = await Promise.all([
+      createLocalHandshake(creatorIdentity, roomId, secret, "creator", "Алиса"),
+      createLocalHandshake(joinerIdentity, roomId, secret, "joiner", "Боб"),
+    ]);
+    const [creatorView, joinerView] = await Promise.all([
+      verifyRemoteHello(joinerLocal.hello, roomId, secret, "creator"),
+      verifyRemoteHello(creatorLocal.hello, roomId, secret, "joiner", creatorIdentity.publicKeyRaw),
+    ]);
+    const [creatorSession, joinerSession] = await Promise.all([
+      deriveSession(creatorLocal, creatorView, secret),
+      deriveSession(joinerLocal, joinerView, secret),
+    ]);
+    const wire = JSON.parse(await creatorSession.cipher.seal({ kind: "session-ready" })) as Record<string, unknown>;
+
+    await expect(joinerSession.cipher.open({ ...wire, sequence: "999" })).rejects.toThrow();
+    await expect(joinerSession.cipher.open(wire)).resolves.toEqual({ kind: "session-ready" });
+  });
 });

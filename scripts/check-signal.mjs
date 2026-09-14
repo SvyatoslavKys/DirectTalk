@@ -4,6 +4,7 @@ import { randomBytes } from "node:crypto";
 const url = process.env.SIGNAL_TEST_URL || "ws://127.0.0.1:8787";
 const origin = process.env.SIGNAL_TEST_ORIGIN || "http://127.0.0.1:5173";
 const roomId = randomBytes(16).toString("base64url");
+const iceGeneration = randomBytes(12).toString("base64url");
 const options = { headers: { Origin: origin } };
 const creator = new WebSocket(url, options);
 const joiner = new WebSocket(url, options);
@@ -23,11 +24,21 @@ try {
   creator.send(
     JSON.stringify({
       type: "signal",
-      payload: { description: { type: "offer", sdp: "v=0\r\n" } },
+      payload: { description: { type: "offer", sdp: "v=0\r\n" }, iceGeneration },
     }),
   );
   const message = await relayed;
   if (message.payload?.description?.type !== "offer") throw new Error("Offer was not relayed");
+  if (message.payload?.iceGeneration !== iceGeneration) throw new Error("ICE generation was not relayed");
+
+  const endOfCandidatesRelayed = nextType(joiner, "signal");
+  creator.send(JSON.stringify({
+    type: "signal",
+    payload: { candidate: { candidate: "" }, iceGeneration },
+  }));
+  const endOfCandidates = await endOfCandidatesRelayed;
+  if (endOfCandidates.payload?.candidate?.candidate !== "") throw new Error("End-of-candidates was not relayed");
+  if (endOfCandidates.payload?.iceGeneration !== iceGeneration) throw new Error("ICE generation was lost from end-of-candidates");
 
   console.log("Signaling integration check passed");
 } finally {

@@ -1,4 +1,5 @@
 import { rtcConfiguration, signalingUrl } from "./config";
+import { base64UrlEncode, randomBytes } from "./encoding";
 import {
   createLocalHandshake,
   deriveSession,
@@ -21,6 +22,12 @@ import {
   type PhotoMimeType,
 } from "./photos";
 import { logDiagnostic, safeErrorText } from "./diagnostics";
+
+const SIGNALING_CLOSE_GRACE_MS = 2_000;
+const DISCONNECTED_GRACE_MS = 1_500;
+const RECOVERY_TIMEOUT_MS = 15_000;
+const RECOVERY_RETRY_DELAY_MS = 1_000;
+const MAX_RECOVERY_ATTEMPTS = 2;
 
 export type ConnectionState =
   | "connecting-signaling"
@@ -94,13 +101,41 @@ export class DirectTalkConnection {
   private closed = false;
   private pendingCandidates: RTCIceCandidateInit[] = [];
   private incomingQueue: Promise<void> = Promise.resolve();
+  private signalingQueue: Promise<void> = Promise.resolve();
   private outgoingQueue: Promise<void> = Promise.resolve();
+  private activeNegotiation?: Promise<void>;
   private reconnectTimer?: number;
+  private signalingCloseTimer?: number;
+  private disconnectedTimer?: number;
+  private recoveryTimer?: number;
   private reconnectAttempts = 0;
+  private recoveryAttempts = 0;
+  private recovering = false;
+  private recoveryOfferStarted = false;
+  private recoveryNegotiated = false;
+  private awaitingRecoveryRemoteDescription = false;
+  private recoveryStartedAt = 0;
+  private recoveryGeneration = 0;
+  private recoverySawChecking = false;
+  private signalingPeerReady = false;
+  private signalingGeneration = 0;
   private peerGeneration = 0;
   private lastStage = "created";
   private localCandidateCount = 0;
   private remoteCandidateCount = 0;
+  private localCandidateTypes = createCandidateCounters();
+  private candidateSummaryLogged = false;
+  private localIceComplete = false;
+  private remoteIceComplete = false;
+  private iceGeneration?: string;
+  private legacyIceGeneration = false;
+  private localIceDescriptionReady = false;
+  private localIceUsernameFragments = new Set<string>();
+  private localDescriptionSignaled = false;
+  private pendingLocalCandidates: RTCIceCandidateInit[] = [];
+  private relayConfigured = false;
+  private txPackets = 0;
+  private rxPackets = 0;
   private rtcConfig?: RTCConfiguration;
   private startPromise?: Promise<void>;
 
@@ -123,38 +158,48 @@ export class DirectTalkConnection {
     this.rtcConfig = await rtcConfiguration();
     if (this.closed) return;
     const serverCount = this.rtcConfig.iceServers?.length ?? 0;
-    const relayEnabled = this.rtcConfig.iceServers?.some((server) => {
+    this.relayConfigured = this.rtcConfig.iceServers?.some((server) => {
       const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
       return urls.some((url) => /^(?:turn|turns):/iu.test(url));
     }) ?? false;
-    this.trace("rtc-configuration-ready", { serverCount, relayEnabled });
+    this.trace("rtc-configuration-ready", { serverCount, relayConfigured: this.relayConfigured });
     if (!this.peerConnection) this.setupPeerConnection();
     this.openSignalingSocket();
   }
 
   private openSignalingSocket(): void {
-    if (this.socket || this.closed || this.secureNotified) return;
-    this.trace("signaling-opening");
+    if (this.socket || this.closed || (this.secureNotified && !this.recovering)) return;
+    this.signalingPeerReady = false;
+    this.trace("signaling-opening", this.recovering ? { attempt: this.recoveryAttempts } : undefined);
     let socket: WebSocket;
     try {
       socket = new WebSocket(signalingUrl());
     } catch (error) {
-      this.fail(error, "signaling-constructor");
+      if (this.recovering) this.handleRecoveryAttemptFailure("signaling-constructor");
+      else this.fail(error, "signaling-constructor");
       return;
     }
+    const signalingGeneration = ++this.signalingGeneration;
     this.socket = socket;
     socket.addEventListener("open", () => {
       if (this.socket !== socket || this.closed) return;
       this.trace("signaling-open");
-      this.reconnectAttempts = 0;
+      if (!this.recovering) this.reconnectAttempts = 0;
       socket.send(JSON.stringify({ type: "join", roomId: this.options.roomId, role: this.options.role }));
       this.trace("signaling-join-sent");
     });
     socket.addEventListener("message", (event) => {
       if (this.socket !== socket || this.closed) return;
-      this.incomingQueue = this.incomingQueue
-        .then(() => this.handleSignalMessage(event.data))
-        .catch((error: unknown) => this.fail(error, "signaling-message"));
+      this.signalingQueue = this.signalingQueue
+        .then(async () => {
+          if (this.socket !== socket || signalingGeneration !== this.signalingGeneration || this.closed) return;
+          await this.handleSignalMessage(event.data);
+        })
+        .catch((error: unknown) => {
+          if (this.socket !== socket || signalingGeneration !== this.signalingGeneration || this.closed) return;
+          if (this.recovering) this.handleRecoveryAttemptFailure("signaling-message");
+          else this.fail(error, "signaling-message");
+        });
     });
     socket.addEventListener("error", () => {
       // The close event schedules a reconnect. Browsers intentionally expose no
@@ -164,8 +209,12 @@ export class DirectTalkConnection {
     socket.addEventListener("close", (event) => {
       if (this.socket !== socket) return;
       this.socket = undefined;
+      this.signalingGeneration += 1;
+      this.signalingPeerReady = false;
       this.trace("signaling-closed", { code: event.code, clean: event.wasClean }, event.wasClean ? "info" : "warn");
-      if (!this.closed && !this.secureNotified) this.scheduleSignalingReconnect(event.reason);
+      if (this.closed) return;
+      if (this.recovering) this.handleRecoveryAttemptFailure("signaling-closed");
+      else if (!this.secureNotified) this.scheduleSignalingReconnect(event.reason);
     });
   }
 
@@ -183,8 +232,19 @@ export class DirectTalkConnection {
       const channel = this.dataChannel;
       const wire = await this.session.cipher.seal(payload);
       await waitForWritableChannel(channel);
+      const bufferedBefore = channel.bufferedAmount;
       channel.send(wire);
-      this.trace("payload-sent", { kind: payload.kind });
+      this.txPackets += 1;
+      if (shouldTracePayload(payload)) {
+        this.trace("payload-queued", {
+          kind: payload.kind,
+          wireSizeBucket: byteSizeBucket(wire.length),
+          bufferedBeforeBucket: byteSizeBucket(bufferedBefore),
+          bufferedAfterBucket: byteSizeBucket(channel.bufferedAmount),
+          txPackets: this.txPackets,
+        });
+        void this.captureTransportSnapshot("payload-queued");
+      }
     });
     this.outgoingQueue = operation.catch(() => undefined);
     return operation;
@@ -195,8 +255,15 @@ export class DirectTalkConnection {
     this.trace("closing");
     this.closed = true;
     if (this.reconnectTimer !== undefined) window.clearTimeout(this.reconnectTimer);
+    if (this.signalingCloseTimer !== undefined) window.clearTimeout(this.signalingCloseTimer);
+    if (this.disconnectedTimer !== undefined) window.clearTimeout(this.disconnectedTimer);
+    if (this.recoveryTimer !== undefined) window.clearTimeout(this.recoveryTimer);
     this.reconnectTimer = undefined;
+    this.signalingCloseTimer = undefined;
+    this.disconnectedTimer = undefined;
+    this.recoveryTimer = undefined;
     this.peerGeneration += 1;
+    this.recoveryGeneration += 1;
     this.dataChannel?.close();
     this.peerConnection?.close();
     this.socket?.close(1000, "Client closed");
@@ -213,31 +280,44 @@ export class DirectTalkConnection {
 
     peerConnection.addEventListener("icecandidate", (event) => {
       if (generation !== this.peerGeneration) return;
-      if (event.candidate) {
-        this.localCandidateCount += 1;
-        this.trace("local-ice-candidate", {
-          count: this.localCandidateCount,
-          iceType: iceCandidateType(event.candidate),
-        });
-        this.sendSignal({ candidate: event.candidate.toJSON() });
-      } else {
-        this.trace("ice-gathering-complete", { count: this.localCandidateCount });
-      }
+      this.handleLocalIceCandidate(event.candidate, peerConnection);
+    });
+    peerConnection.addEventListener("icecandidateerror", (rawEvent) => {
+      if (generation !== this.peerGeneration) return;
+      const event = rawEvent as RTCPeerConnectionIceErrorEvent;
+      const server = safeIceServerDescriptor(event.url);
+      this.trace("ice-candidate-error", {
+        errorCode: event.errorCode,
+        urlScheme: server.urlScheme,
+        transport: server.transport,
+      }, "warn");
     });
     peerConnection.addEventListener("icegatheringstatechange", () => {
-      if (generation === this.peerGeneration) this.trace("ice-gathering-state", { state: peerConnection.iceGatheringState });
+      if (generation !== this.peerGeneration) return;
+      this.trace("ice-gathering-state", { state: peerConnection.iceGatheringState });
+      if (peerConnection.iceGatheringState === "complete" && this.localIceDescriptionReady) {
+        this.handleLocalIceComplete();
+      }
     });
     peerConnection.addEventListener("iceconnectionstatechange", () => {
-      if (generation === this.peerGeneration) this.trace("ice-connection-state", { state: peerConnection.iceConnectionState });
+      if (generation !== this.peerGeneration) return;
+      this.trace("ice-connection-state", { state: peerConnection.iceConnectionState });
+      if (this.recovering && peerConnection.iceConnectionState === "checking") this.recoverySawChecking = true;
+      if (
+        this.recovering &&
+        this.recoveryNegotiated &&
+        this.recoverySawChecking &&
+        (peerConnection.iceConnectionState === "connected" || peerConnection.iceConnectionState === "completed")
+      ) {
+        this.finishIceRecoveryIfConnected();
+      }
     });
     peerConnection.addEventListener("signalingstatechange", () => {
       if (generation === this.peerGeneration) this.trace("peer-signaling-state", { state: peerConnection.signalingState });
     });
     peerConnection.addEventListener("connectionstatechange", () => {
       if (generation !== this.peerGeneration) return;
-      this.trace("peer-connection-state", { state: peerConnection.connectionState });
-      if (peerConnection.connectionState === "failed") this.fail(new Error("Не удалось установить WebRTC-соединение"), "peer-connection");
-      if (peerConnection.connectionState === "closed" && !this.closed) this.close();
+      this.handlePeerConnectionStateChange(peerConnection);
     });
     peerConnection.addEventListener("datachannel", (event) => {
       if (generation === this.peerGeneration) this.attachDataChannel(event.channel, generation);
@@ -276,16 +356,29 @@ export class DirectTalkConnection {
         this.fail(new Error("Получен слишком большой или неподдерживаемый пакет"), "data-channel-packet-format");
         return;
       }
-      this.trace("data-channel-message", { bytes: event.data.length, phase: this.session ? "encrypted" : "handshake" });
+      this.rxPackets += 1;
+      if (!this.session) {
+        this.trace("data-channel-message", {
+          wireSizeBucket: byteSizeBucket(event.data.length),
+          phase: "handshake",
+          rxPackets: this.rxPackets,
+        });
+      }
       this.incomingQueue = this.incomingQueue
         .then(() => this.handleDataMessage(event.data))
         .catch((error: unknown) => this.fail(error, "data-channel-message"));
     });
     channel.addEventListener("close", () => {
-      if (generation === this.peerGeneration && !this.closed) this.fail(new Error("Прямое соединение закрыто"), "data-channel-close");
+      if (generation !== this.peerGeneration || this.closed) return;
+      this.trace("data-channel-closed", { state: channel.readyState }, "warn");
+      void this.captureTransportSnapshot("data-channel-closed");
+      this.fail(new Error("Прямое соединение закрыто"), "data-channel-close");
     });
     channel.addEventListener("error", () => {
-      if (generation === this.peerGeneration) this.fail(new Error("Ошибка WebRTC DataChannel"), "data-channel-error");
+      if (generation !== this.peerGeneration) return;
+      this.trace("data-channel-error", { state: channel.readyState }, "error");
+      void this.captureTransportSnapshot("data-channel-error");
+      this.fail(new Error("Ошибка WebRTC DataChannel"), "data-channel-error");
     });
   }
 
@@ -294,16 +387,26 @@ export class DirectTalkConnection {
     const message = JSON.parse(raw) as Record<string, unknown>;
     this.trace("signaling-message", { type: typeof message.type === "string" ? message.type : "invalid" });
     if (message.type === "joined") {
-      this.options.onState("waiting-peer");
+      if (!this.secureNotified && !this.recovering) this.options.onState("waiting-peer");
       return;
     }
     if (message.type === "peer-ready") {
+      this.signalingPeerReady = true;
+      if (this.secureNotified) {
+        if (!this.recovering) this.startIceRecovery("peer-ready");
+        if (!this.recovering) return;
+        this.trace("ice-recovery-peer-ready", { attempt: this.recoveryAttempts });
+        if (this.options.role === "creator") await this.createRecoveryOffer();
+        return;
+      }
       this.options.onState("connecting-peer");
       if (this.options.role === "creator") await this.createOffer();
       return;
     }
     if (message.type === "peer-left") {
-      if (!this.secureNotified) {
+      if (this.recovering) {
+        this.handleRecoveryAttemptFailure("peer-left");
+      } else if (!this.secureNotified) {
         this.resetPeerConnection();
         this.setupPeerConnection();
         this.options.onState("waiting-peer");
@@ -311,6 +414,14 @@ export class DirectTalkConnection {
       return;
     }
     if (message.type === "error") {
+      if (this.recovering) {
+        this.handleRecoveryAttemptFailure("signaling-error");
+        return;
+      }
+      if (this.secureNotified) {
+        this.trace("signaling-response-error", { code: safeSignalErrorCode(message.code) }, "warn");
+        return;
+      }
       throw new Error(signalErrorText(message.code));
     }
     if (message.type !== "signal" || !message.payload || typeof message.payload !== "object") {
@@ -318,8 +429,9 @@ export class DirectTalkConnection {
     }
 
     const payload = message.payload as Record<string, unknown>;
-    if (payload.description) await this.handleRemoteDescription(payload.description);
-    else if (payload.candidate) await this.handleRemoteCandidate(payload.candidate);
+    const iceGeneration = parseSignaledIceGeneration(payload);
+    if (payload.description) await this.handleRemoteDescription(payload.description, iceGeneration);
+    else if (payload.candidate) await this.handleRemoteCandidate(payload.candidate, iceGeneration);
     else throw new Error("Некорректные signaling-данные");
   }
 
@@ -329,47 +441,174 @@ export class DirectTalkConnection {
     this.trace("offer-creating");
     const peerConnection = this.requirePeerConnection();
     const offer = await peerConnection.createOffer();
+    this.iceGeneration = createIceGeneration();
+    this.legacyIceGeneration = false;
+    this.prepareLocalIceDescription(offer);
     await peerConnection.setLocalDescription(offer);
+    this.syncLocalIceUsernameFragments(peerConnection.localDescription);
     this.trace("offer-local-set");
-    this.sendSignal({ description: offer });
+    this.signalLocalDescription(offer);
   }
 
-  private async handleRemoteDescription(value: unknown): Promise<void> {
+  private createRecoveryOffer(): Promise<void> {
+    if (!this.recovering || this.recoveryOfferStarted || !this.signalingPeerReady) return Promise.resolve();
+    const operation = this.performCreateRecoveryOffer();
+    this.activeNegotiation = operation;
+    return operation.finally(() => {
+      if (this.activeNegotiation === operation) this.activeNegotiation = undefined;
+    });
+  }
+
+  private async performCreateRecoveryOffer(): Promise<void> {
+    const recoveryGeneration = this.recoveryGeneration;
+    this.recoveryOfferStarted = true;
+    this.recoveryNegotiated = false;
+    this.awaitingRecoveryRemoteDescription = true;
+    this.localCandidateCount = 0;
+    this.localCandidateTypes = createCandidateCounters();
+    this.candidateSummaryLogged = false;
+    this.trace("ice-recovery-offer-creating", { attempt: this.recoveryAttempts });
+    const peerConnection = this.requirePeerConnection();
+    const offer = await peerConnection.createOffer({ iceRestart: true });
+    if (!this.isCurrentRecovery(recoveryGeneration, peerConnection)) return;
+    this.iceGeneration = createIceGeneration();
+    this.legacyIceGeneration = false;
+    this.prepareLocalIceDescription(offer);
+    await peerConnection.setLocalDescription(offer);
+    if (!this.isCurrentRecovery(recoveryGeneration, peerConnection)) return;
+    this.syncLocalIceUsernameFragments(peerConnection.localDescription);
+    this.trace("ice-recovery-offer-local-set", { attempt: this.recoveryAttempts });
+    this.signalLocalDescription(offer);
+  }
+
+  private handleRemoteDescription(value: unknown, iceGeneration?: string): Promise<void> {
+    const operation = this.applyRemoteDescription(value, iceGeneration);
+    this.activeNegotiation = operation;
+    return operation.finally(() => {
+      if (this.activeNegotiation === operation) this.activeNegotiation = undefined;
+    });
+  }
+
+  private async applyRemoteDescription(value: unknown, iceGeneration?: string): Promise<void> {
     if (!value || typeof value !== "object") throw new Error("Некорректное SDP");
     const description = value as RTCSessionDescriptionInit;
-    this.trace("remote-description", { type: typeof description.type === "string" ? description.type : "invalid" });
+    this.trace("remote-description", {
+      type: typeof description.type === "string" ? description.type : "invalid",
+      recovery: this.recovering,
+    });
     if (description.type !== "offer" && description.type !== "answer") throw new Error("Некорректный тип SDP");
     if (this.options.role === "creator" && description.type !== "answer") throw new Error("Ожидался SDP answer");
     if (this.options.role === "joiner" && description.type !== "offer") throw new Error("Ожидался SDP offer");
+    if (description.type === "answer") {
+      if (iceGeneration && this.iceGeneration && iceGeneration !== this.iceGeneration) {
+        this.trace("stale-ice-description-ignored", { type: description.type }, "warn");
+        return;
+      }
+      if (!iceGeneration) this.legacyIceGeneration = true;
+    } else {
+      if (this.secureNotified && iceGeneration && iceGeneration === this.iceGeneration) {
+        this.trace("duplicate-ice-description-ignored", { type: description.type }, "warn");
+        return;
+      }
+    }
+    if (this.secureNotified && description.type === "offer" && !this.recovering) {
+      this.startIceRecovery("remote-offer");
+      if (!this.recovering) return;
+    } else if (this.secureNotified && description.type === "answer" && !this.recovering) {
+      this.trace("unexpected-recovery-answer", undefined, "warn");
+      return;
+    }
+    if (description.type === "offer") {
+      this.iceGeneration = iceGeneration;
+      this.legacyIceGeneration = !iceGeneration;
+      this.localIceDescriptionReady = false;
+      this.localIceUsernameFragments.clear();
+      this.localDescriptionSignaled = false;
+      this.pendingLocalCandidates = [];
+    }
 
     const peerConnection = this.requirePeerConnection();
+    const recoveryOperation = this.recovering;
+    const recoveryGeneration = this.recoveryGeneration;
+    if (this.recovering && description.type === "offer") {
+      this.recoveryOfferStarted = true;
+      this.recoveryNegotiated = false;
+    }
     await peerConnection.setRemoteDescription(description);
+    if (recoveryOperation && !this.isCurrentRecovery(recoveryGeneration, peerConnection)) return;
+    if (this.recovering) this.awaitingRecoveryRemoteDescription = false;
     this.trace("remote-description-set", { type: description.type, queuedCandidates: this.pendingCandidates.length });
-    for (const candidate of this.pendingCandidates.splice(0)) await peerConnection.addIceCandidate(candidate);
+    for (const candidate of this.pendingCandidates.splice(0)) {
+      await addIceCandidate(peerConnection, candidate);
+      if (recoveryOperation && !this.isCurrentRecovery(recoveryGeneration, peerConnection)) return;
+    }
 
     if (description.type === "offer") {
+      if (this.recovering) {
+        this.localCandidateCount = 0;
+        this.localCandidateTypes = createCandidateCounters();
+        this.candidateSummaryLogged = false;
+      }
       const answer = await peerConnection.createAnswer();
+      if (recoveryOperation && !this.isCurrentRecovery(recoveryGeneration, peerConnection)) return;
+      this.prepareLocalIceDescription(answer);
       await peerConnection.setLocalDescription(answer);
+      if (recoveryOperation && !this.isCurrentRecovery(recoveryGeneration, peerConnection)) return;
+      this.syncLocalIceUsernameFragments(peerConnection.localDescription);
       this.trace("answer-local-set");
-      this.sendSignal({ description: answer });
+      this.signalLocalDescription(answer);
+      if (this.recovering && recoveryGeneration === this.recoveryGeneration) {
+        this.recoveryNegotiated = true;
+        this.finishIceRecoveryIfConnected();
+      }
+    } else if (this.recovering && recoveryGeneration === this.recoveryGeneration) {
+      this.recoveryNegotiated = true;
+      this.finishIceRecoveryIfConnected();
     }
   }
 
-  private async handleRemoteCandidate(value: unknown): Promise<void> {
+  private async handleRemoteCandidate(value: unknown, iceGeneration?: string): Promise<void> {
+    const peerConnection = this.requirePeerConnection();
+    if (
+      !this.iceGeneration &&
+      iceGeneration === undefined &&
+      (!peerConnection.remoteDescription || (this.recovering && this.awaitingRecoveryRemoteDescription))
+    ) {
+      this.legacyIceGeneration = true;
+    }
+    const generationMatches = this.legacyIceGeneration
+      ? iceGeneration === undefined
+      : Boolean(this.iceGeneration && iceGeneration === this.iceGeneration);
+    if (!generationMatches) {
+      this.trace("stale-ice-candidate-ignored", undefined, "warn");
+      return;
+    }
     if (!value || typeof value !== "object") throw new Error("Некорректный ICE candidate");
     const candidate = value as RTCIceCandidateInit;
     if (typeof candidate.candidate !== "string" || candidate.candidate.length > 4_096) {
       throw new Error("Некорректный ICE candidate");
     }
-    const peerConnection = this.requirePeerConnection();
+    if (candidate.candidate === "") {
+      this.remoteIceComplete = true;
+      this.trace("remote-ice-complete");
+      if (!peerConnection.remoteDescription || (this.recovering && this.awaitingRecoveryRemoteDescription)) {
+        this.pendingCandidates.push(candidate);
+      } else {
+        await addIceCandidate(peerConnection, candidate);
+      }
+      this.maybeScheduleSignalingClose();
+      return;
+    }
     this.remoteCandidateCount += 1;
     this.trace("remote-ice-candidate", {
       count: this.remoteCandidateCount,
-      queued: !peerConnection.remoteDescription,
+      queued: !peerConnection.remoteDescription || (this.recovering && this.awaitingRecoveryRemoteDescription),
       iceType: iceCandidateInitType(candidate),
     });
-    if (!peerConnection.remoteDescription) this.pendingCandidates.push(candidate);
-    else await peerConnection.addIceCandidate(candidate);
+    if (!peerConnection.remoteDescription || (this.recovering && this.awaitingRecoveryRemoteDescription)) {
+      this.pendingCandidates.push(candidate);
+    }
+    else await addIceCandidate(peerConnection, candidate);
   }
 
   private sendHello(): Promise<void> {
@@ -425,15 +664,40 @@ export class DirectTalkConnection {
       return;
     }
 
-    const payload = parseAppPayload(await this.session.cipher.open(value));
-    this.trace("payload-received", { kind: payload.kind });
+    let opened: unknown;
+    try {
+      opened = await this.session.cipher.open(value);
+    } catch (error) {
+      this.trace("payload-decrypt-failed", { reason: safeErrorText(error) }, "error");
+      throw error;
+    }
+    let payload: AppPayload;
+    try {
+      payload = parseAppPayload(opened);
+    } catch (error) {
+      this.trace("payload-validation-failed", { reason: safeErrorText(error) }, "error");
+      throw error;
+    }
+    if (shouldTracePayload(payload)) {
+      this.trace("payload-received", {
+        kind: payload.kind,
+        wireSizeBucket: byteSizeBucket(raw.length),
+        rxPackets: this.rxPackets,
+      });
+    }
     if (payload.kind === "session-ready") {
       this.receivedSessionReady = true;
       this.notifySecureIfReady();
       return;
     }
     if (!this.receivedSessionReady) throw new Error("Данные получены до подтверждения защищённой сессии");
-    await this.options.onPayload(payload);
+    try {
+      await this.options.onPayload(payload);
+    } catch (error) {
+      this.trace("payload-handler-failed", { kind: payload.kind, errorName: safeErrorName(error) }, "error");
+      throw error;
+    }
+    if (shouldTracePayload(payload)) this.trace("payload-handler-complete", { kind: payload.kind });
   }
 
   private async sendSessionReady(): Promise<void> {
@@ -456,9 +720,362 @@ export class DirectTalkConnection {
       fingerprint: this.session.peerFingerprint,
       securityCode: this.session.securityCode,
     });
-    const signalingSocket = this.socket;
+    this.maybeScheduleSignalingClose();
+  }
+
+  private handlePeerConnectionStateChange(peerConnection: RTCPeerConnection): void {
+    const { connectionState } = peerConnection;
+    this.trace("peer-connection-state", { state: connectionState });
+    if (connectionState === "connected" || connectionState === "disconnected" || connectionState === "failed") {
+      void this.captureTransportSnapshot(connectionState);
+    }
+
+    if (connectionState === "connected") {
+      if (this.disconnectedTimer !== undefined) window.clearTimeout(this.disconnectedTimer);
+      this.disconnectedTimer = undefined;
+      if (this.recovering) {
+        if (!this.recoveryOfferStarted) this.finishIceRecovery();
+        else {
+          this.finishIceRecoveryIfConnected();
+          if (this.recovering) {
+            this.trace("ice-recovery-connected-awaiting-route", { attempt: this.recoveryAttempts });
+          }
+        }
+      } else if (this.recoveryAttempts > 0 && peerConnection.signalingState === "stable") {
+        this.finishIceRecovery();
+      }
+      this.maybeScheduleSignalingClose();
+      return;
+    }
+
+    if (connectionState === "disconnected") {
+      this.cancelSignalingClose();
+      if (!this.secureNotified || this.disconnectedTimer !== undefined || this.recovering) return;
+      this.trace("ice-recovery-grace-started", { delay: DISCONNECTED_GRACE_MS }, "warn");
+      this.disconnectedTimer = window.setTimeout(() => {
+        this.disconnectedTimer = undefined;
+        if (this.peerConnection?.connectionState === "disconnected") this.startIceRecovery("disconnected");
+      }, DISCONNECTED_GRACE_MS);
+      return;
+    }
+
+    if (connectionState === "failed") {
+      this.cancelSignalingClose();
+      if (this.disconnectedTimer !== undefined) window.clearTimeout(this.disconnectedTimer);
+      this.disconnectedTimer = undefined;
+      if (this.secureNotified) this.startIceRecovery("failed");
+      else this.fail(new Error("Не удалось установить WebRTC-соединение"), "peer-connection");
+      return;
+    }
+
+    if (connectionState === "closed" && !this.closed) this.close();
+  }
+
+  private startIceRecovery(trigger: string): void {
+    if (this.closed || this.recovering) return;
+    if (!this.secureNotified || !this.session || !this.peerConnection || this.dataChannel?.readyState !== "open") {
+      this.fail(new Error("Не удалось восстановить прямое соединение"), "ice-recovery-unavailable");
+      return;
+    }
+    if (this.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+      this.fail(new Error("Не удалось восстановить WebRTC-соединение"), "ice-recovery-exhausted");
+      return;
+    }
+
+    this.recovering = true;
+    this.recoveryAttempts += 1;
+    this.recoveryGeneration += 1;
+    this.recoveryOfferStarted = false;
+    this.recoveryNegotiated = false;
+    this.recoverySawChecking = false;
+    this.awaitingRecoveryRemoteDescription = true;
+    this.recoveryStartedAt = Date.now();
+    this.pendingCandidates = [];
+    this.remoteCandidateCount = 0;
+    this.localIceComplete = false;
+    this.remoteIceComplete = false;
+    this.candidateSummaryLogged = false;
+    this.iceGeneration = undefined;
+    this.legacyIceGeneration = false;
+    this.localIceDescriptionReady = false;
+    this.localIceUsernameFragments.clear();
+    this.localDescriptionSignaled = false;
+    this.pendingLocalCandidates = [];
+    this.cancelSignalingClose();
+    this.trace("ice-recovery-started", { attempt: this.recoveryAttempts, trigger }, "warn");
+
+    if (!this.socket) this.openSignalingSocket();
+    else if (this.socket.readyState === WebSocket.OPEN && this.signalingPeerReady && this.options.role === "creator") {
+      void this.createRecoveryOffer().catch(() => this.handleRecoveryAttemptFailure("offer-create"));
+    }
+
+    if (!this.recovering || this.closed) return;
+    this.recoveryTimer = window.setTimeout(() => {
+      this.recoveryTimer = undefined;
+      this.handleRecoveryAttemptFailure("timeout");
+    }, RECOVERY_TIMEOUT_MS);
+  }
+
+  private handleRecoveryAttemptFailure(trigger: string): void {
+    if (this.closed || !this.recovering) return;
+    if (
+      (!this.recoveryOfferStarted && this.peerConnection?.connectionState === "connected") ||
+      this.isRecoveredIceRoute()
+    ) {
+      this.finishIceRecovery();
+      return;
+    }
+    if (this.recoveryTimer !== undefined) window.clearTimeout(this.recoveryTimer);
+    this.recoveryTimer = undefined;
+    this.recovering = false;
+    this.recoveryNegotiated = false;
+    this.awaitingRecoveryRemoteDescription = false;
+    this.pendingCandidates = [];
+    this.localIceDescriptionReady = false;
+    this.localIceUsernameFragments.clear();
+    this.localDescriptionSignaled = false;
+    this.pendingLocalCandidates = [];
+    const recoveryGeneration = ++this.recoveryGeneration;
+    this.trace("ice-recovery-attempt-failed", { attempt: this.recoveryAttempts, trigger }, "warn");
+    this.closeSignalingSocket("recovery-retry");
+
+    if (this.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
+      this.fail(new Error("Не удалось восстановить WebRTC-соединение"), "ice-recovery-exhausted");
+      return;
+    }
+
+    const delay = RECOVERY_RETRY_DELAY_MS * this.recoveryAttempts;
+    void this.prepareRecoveryRetry(recoveryGeneration, delay);
+  }
+
+  private finishIceRecovery(): void {
+    const attempt = this.recoveryAttempts;
+    if (this.recoveryTimer !== undefined) window.clearTimeout(this.recoveryTimer);
+    if (this.reconnectTimer !== undefined) window.clearTimeout(this.reconnectTimer);
+    this.recoveryTimer = undefined;
+    this.reconnectTimer = undefined;
+    this.recovering = false;
+    this.recoveryGeneration += 1;
+    this.recoveryOfferStarted = false;
+    this.recoveryNegotiated = false;
+    this.recoverySawChecking = false;
+    this.awaitingRecoveryRemoteDescription = false;
+    this.pendingCandidates = [];
+    this.recoveryAttempts = 0;
+    this.trace("ice-recovery-succeeded", {
+      attempt,
+      durationMs: Math.max(0, Date.now() - this.recoveryStartedAt),
+    });
+    this.maybeScheduleSignalingClose();
+  }
+
+  private async prepareRecoveryRetry(recoveryGeneration: number, delay: number): Promise<void> {
+    const peerConnection = this.peerConnection;
+    if (!peerConnection) return;
+    const activeNegotiation = this.activeNegotiation;
+    if (activeNegotiation) await activeNegotiation.catch(() => undefined);
+    if (this.closed || recoveryGeneration !== this.recoveryGeneration || peerConnection !== this.peerConnection) return;
+    try {
+      if (peerConnection.signalingState === "have-local-offer") {
+        await peerConnection.setLocalDescription({ type: "rollback" });
+      } else if (peerConnection.signalingState === "have-remote-offer") {
+        await peerConnection.setRemoteDescription({ type: "rollback" });
+      } else if (peerConnection.signalingState !== "stable") {
+        throw new Error("WebRTC signaling state cannot be rolled back");
+      }
+    } catch {
+      if (!this.closed && recoveryGeneration === this.recoveryGeneration) {
+        this.fail(new Error("Не удалось подготовить повторное восстановление"), "ice-recovery-rollback");
+      }
+      return;
+    }
+    if (this.closed || recoveryGeneration !== this.recoveryGeneration || peerConnection !== this.peerConnection) return;
+    this.recoveryOfferStarted = false;
+    this.recoverySawChecking = false;
+    if (peerConnection.connectionState === "connected") {
+      this.finishIceRecovery();
+      return;
+    }
+    this.trace("ice-recovery-retry-scheduled", { attempt: this.recoveryAttempts + 1, delay }, "warn");
+    this.reconnectTimer = window.setTimeout(() => {
+      this.reconnectTimer = undefined;
+      if (this.closed || recoveryGeneration !== this.recoveryGeneration) return;
+      if (this.peerConnection?.connectionState === "connected" && this.peerConnection.signalingState === "stable") {
+        this.finishIceRecovery();
+      } else {
+        this.startIceRecovery("retry");
+      }
+    }, delay);
+  }
+
+  private finishIceRecoveryIfConnected(): void {
+    if (this.recovering && this.isRecoveredIceRoute()) this.finishIceRecovery();
+  }
+
+  private isCurrentRecovery(recoveryGeneration: number, peerConnection: RTCPeerConnection): boolean {
+    return this.recovering &&
+      recoveryGeneration === this.recoveryGeneration &&
+      peerConnection === this.peerConnection;
+  }
+
+  private isRecoveredIceRoute(): boolean {
+    const peerConnection = this.peerConnection;
+    return Boolean(
+      this.recovering &&
+      this.recoveryNegotiated &&
+      this.recoverySawChecking &&
+      peerConnection?.connectionState === "connected" &&
+      (peerConnection.iceConnectionState === "connected" || peerConnection.iceConnectionState === "completed") &&
+      peerConnection.signalingState === "stable"
+    );
+  }
+
+  private maybeScheduleSignalingClose(): void {
+    if (
+      this.closed ||
+      !this.secureNotified ||
+      this.recovering ||
+      this.signalingCloseTimer !== undefined ||
+      this.socket?.readyState !== WebSocket.OPEN ||
+      !this.localIceComplete ||
+      !this.remoteIceComplete ||
+      this.peerConnection?.connectionState !== "connected"
+    ) {
+      return;
+    }
+    this.trace("signaling-close-scheduled", { delay: SIGNALING_CLOSE_GRACE_MS });
+    this.signalingCloseTimer = window.setTimeout(() => {
+      this.signalingCloseTimer = undefined;
+      if (
+        this.closed ||
+        this.recovering ||
+        this.peerConnection?.connectionState !== "connected" ||
+        !this.localIceComplete ||
+        !this.remoteIceComplete
+      ) {
+        return;
+      }
+      this.closeSignalingSocket("ice-complete");
+    }, SIGNALING_CLOSE_GRACE_MS);
+  }
+
+  private cancelSignalingClose(): void {
+    if (this.signalingCloseTimer !== undefined) window.clearTimeout(this.signalingCloseTimer);
+    this.signalingCloseTimer = undefined;
+  }
+
+  private closeSignalingSocket(trigger: string): void {
+    const socket = this.socket;
     this.socket = undefined;
-    signalingSocket?.close(1000, "Signaling complete");
+    this.signalingGeneration += 1;
+    this.signalingPeerReady = false;
+    if (!socket) return;
+    this.trace("signaling-closing", { trigger });
+    socket.close(1000, "Signaling complete");
+  }
+
+  private handleLocalIceCandidate(candidate: RTCIceCandidate | null, peerConnection: RTCPeerConnection): void {
+    if (!this.localIceDescriptionReady) {
+      this.trace("stale-local-ice-event-ignored", { reason: "no-current-local-description" }, "warn");
+      return;
+    }
+    if (!candidate) {
+      if (peerConnection.iceGatheringState === "complete") this.handleLocalIceComplete();
+      else this.trace("stale-local-ice-event-ignored", { reason: "gathering-not-complete" }, "warn");
+      return;
+    }
+    const usernameFragment = iceCandidateUsernameFragment(candidate);
+    if (
+      usernameFragment &&
+      this.localIceUsernameFragments.size > 0 &&
+      !this.localIceUsernameFragments.has(usernameFragment)
+    ) {
+      this.trace("stale-local-ice-event-ignored", { reason: "username-fragment-mismatch" }, "warn");
+      return;
+    }
+    this.localCandidateCount += 1;
+    const iceType = iceCandidateType(candidate);
+    incrementCandidateCounter(this.localCandidateTypes, iceType);
+    const candidateInit = candidate.toJSON();
+    this.trace("local-ice-candidate", {
+      count: this.localCandidateCount,
+      iceType,
+      queued: !this.localDescriptionSignaled,
+    });
+    if (this.localDescriptionSignaled) this.sendSignal({ candidate: candidateInit });
+    else this.pendingLocalCandidates.push(candidateInit);
+  }
+
+  private prepareLocalIceDescription(description: RTCSessionDescriptionInit): void {
+    this.localIceDescriptionReady = true;
+    this.localIceUsernameFragments = iceUsernameFragments(description.sdp);
+    this.localCandidateCount = 0;
+    this.localCandidateTypes = createCandidateCounters();
+    this.candidateSummaryLogged = false;
+    this.localIceComplete = false;
+    this.localDescriptionSignaled = false;
+    this.pendingLocalCandidates = [];
+  }
+
+  private syncLocalIceUsernameFragments(description: RTCSessionDescription | null): void {
+    const fragments = iceUsernameFragments(description?.sdp);
+    if (fragments.size > 0) this.localIceUsernameFragments = fragments;
+  }
+
+  private signalLocalDescription(description: RTCSessionDescriptionInit): void {
+    if (!this.sendSignal({ description })) return;
+    this.localDescriptionSignaled = true;
+    for (const candidate of this.pendingLocalCandidates.splice(0)) {
+      this.sendSignal({ candidate });
+    }
+  }
+
+  private handleLocalIceComplete(): void {
+    this.traceCandidateSummary();
+    if (!this.localIceComplete) {
+      this.localIceComplete = true;
+      const [usernameFragment] = this.localIceUsernameFragments;
+      const candidate = usernameFragment ? { candidate: "", usernameFragment } : { candidate: "" };
+      if (this.localDescriptionSignaled) this.sendSignal({ candidate });
+      else this.pendingLocalCandidates.push(candidate);
+      this.trace("local-ice-complete-signaled");
+    }
+    this.maybeScheduleSignalingClose();
+  }
+
+  private traceCandidateSummary(): void {
+    if (this.candidateSummaryLogged) return;
+    this.candidateSummaryLogged = true;
+    const details = {
+      count: this.localCandidateCount,
+      hostCandidates: this.localCandidateTypes.host,
+      srflxCandidates: this.localCandidateTypes.srflx,
+      prflxCandidates: this.localCandidateTypes.prflx,
+      relayCandidates: this.localCandidateTypes.relay,
+      relayConfigured: this.relayConfigured,
+    };
+    this.trace("ice-gathering-complete", details);
+    if (this.relayConfigured && this.localCandidateTypes.relay === 0) {
+      this.trace("relay-route-unavailable", details, "warn");
+    }
+  }
+
+  private async captureTransportSnapshot(trigger: string): Promise<void> {
+    const peerConnection = this.peerConnection;
+    const generation = this.peerGeneration;
+    if (!peerConnection || this.closed) return;
+    try {
+      const report = await peerConnection.getStats();
+      if (this.closed || generation !== this.peerGeneration || peerConnection !== this.peerConnection) return;
+      this.trace("transport-snapshot", {
+        trigger,
+        ...summarizeTransportStats(report, this.dataChannel),
+      });
+    } catch {
+      if (!this.closed && generation === this.peerGeneration) {
+        this.trace("transport-stats-unavailable", { trigger }, "warn");
+      }
+    }
   }
 
   private scheduleSignalingReconnect(_reason: string): void {
@@ -494,15 +1111,37 @@ export class DirectTalkConnection {
     this.pendingCandidates = [];
     this.localCandidateCount = 0;
     this.remoteCandidateCount = 0;
+    this.localCandidateTypes = createCandidateCounters();
+    this.candidateSummaryLogged = false;
+    this.localIceComplete = false;
+    this.remoteIceComplete = false;
+    this.iceGeneration = undefined;
+    this.legacyIceGeneration = false;
+    this.localIceDescriptionReady = false;
+    this.localIceUsernameFragments.clear();
+    this.localDescriptionSignaled = false;
+    this.pendingLocalCandidates = [];
+    this.signalingPeerReady = false;
+    this.recovering = false;
+    this.recoveryGeneration += 1;
+    this.recoveryOfferStarted = false;
+    this.recoveryNegotiated = false;
+    this.recoverySawChecking = false;
+    this.awaitingRecoveryRemoteDescription = false;
   }
 
-  private sendSignal(payload: Record<string, unknown>): void {
+  private sendSignal(payload: Record<string, unknown>): boolean {
     if (this.socket?.readyState !== WebSocket.OPEN) {
-      if (!this.closed && !this.secureNotified) this.fail(new Error("Signaling-соединение недоступно"), "signaling-send");
-      return;
+      if (this.recovering) this.handleRecoveryAttemptFailure("signaling-send");
+      else if (!this.closed && !this.secureNotified) this.fail(new Error("Signaling-соединение недоступно"), "signaling-send");
+      return false;
     }
-    this.socket.send(JSON.stringify({ type: "signal", payload }));
+    const signalPayload = this.iceGeneration && !this.legacyIceGeneration
+      ? { ...payload, iceGeneration: this.iceGeneration }
+      : payload;
+    this.socket.send(JSON.stringify({ type: "signal", payload: signalPayload }));
     this.trace("signal-sent", { kind: "description" in payload ? "description" : "candidate" });
+    return true;
   }
 
   private requirePeerConnection(): RTCPeerConnection {
@@ -671,10 +1310,160 @@ function signalErrorText(code: unknown): string {
   }
 }
 
+function safeSignalErrorCode(code: unknown): string {
+  return code === "room-full" ||
+    code === "peer-unavailable" ||
+    code === "backend-unavailable" ||
+    code === "invalid-join" ||
+    code === "invalid-signal" ||
+    code === "invalid-message" ||
+    code === "invalid-json"
+    ? code
+    : "unknown";
+}
+
+function createIceGeneration(): string {
+  return base64UrlEncode(randomBytes(12));
+}
+
+function parseSignaledIceGeneration(payload: Record<string, unknown>): string | undefined {
+  if (!("iceGeneration" in payload)) return undefined;
+  if (typeof payload.iceGeneration !== "string" || !/^[A-Za-z0-9_-]{16}$/u.test(payload.iceGeneration)) {
+    throw new Error("Некорректное поколение ICE");
+  }
+  return payload.iceGeneration;
+}
+
+async function addIceCandidate(peerConnection: RTCPeerConnection, candidate: RTCIceCandidateInit): Promise<void> {
+  await peerConnection.addIceCandidate(candidate);
+}
+
 function iceCandidateType(candidate: RTCIceCandidate): string {
   return candidate.type || iceCandidateInitType(candidate.toJSON());
 }
 
+function iceCandidateUsernameFragment(candidate: RTCIceCandidate): string | undefined {
+  if (typeof candidate.usernameFragment === "string" && candidate.usernameFragment) {
+    return candidate.usernameFragment;
+  }
+  return candidate.candidate.match(/(?:^|\s)ufrag\s+([^\s]+)/u)?.[1];
+}
+
+function iceUsernameFragments(sdp: string | null | undefined): Set<string> {
+  if (!sdp) return new Set();
+  return new Set(
+    [...sdp.matchAll(/^a=ice-ufrag:([^\r\n]+)\r?$/gmu)]
+      .map((match) => match[1]?.trim())
+      .filter((value): value is string => Boolean(value)),
+  );
+}
+
 function iceCandidateInitType(candidate: RTCIceCandidateInit): string {
   return candidate.candidate?.match(/\styp\s(host|srflx|prflx|relay)(?:\s|$)/iu)?.[1]?.toLowerCase() ?? "unknown";
+}
+
+type CandidateType = "host" | "srflx" | "prflx" | "relay";
+type CandidateCounters = Record<CandidateType, number>;
+type StatsRecord = Record<string, unknown> & { id?: string; type?: string };
+
+function createCandidateCounters(): CandidateCounters {
+  return { host: 0, srflx: 0, prflx: 0, relay: 0 };
+}
+
+function incrementCandidateCounter(counters: CandidateCounters, candidateType: string): void {
+  if (candidateType === "host" || candidateType === "srflx" || candidateType === "prflx" || candidateType === "relay") {
+    counters[candidateType] += 1;
+  }
+}
+
+function shouldTracePayload(payload: AppPayload): boolean {
+  return payload.kind !== "photo-chunk" || payload.index === 0 || payload.index % 32 === 0;
+}
+
+function safeIceServerDescriptor(rawUrl: string | null | undefined): { urlScheme: string; transport: string } {
+  const value = typeof rawUrl === "string" ? rawUrl : "";
+  const urlScheme = value.match(/^(stun|stuns|turn|turns):/iu)?.[1]?.toLowerCase() ?? "unknown";
+  const queryTransport = value.match(/[?&]transport=(udp|tcp)(?:&|$)/iu)?.[1]?.toLowerCase();
+  const transport = queryTransport ?? (urlScheme === "turns" ? "tls" : "unknown");
+  return { urlScheme, transport };
+}
+
+export function summarizeTransportStats(
+  report: RTCStatsReport,
+  channel?: Pick<RTCDataChannel, "readyState" | "bufferedAmount">,
+): Record<string, string | number | boolean | undefined> {
+  const records: StatsRecord[] = [];
+  report.forEach((record) => records.push(record as unknown as StatsRecord));
+  const byId = new Map(records.flatMap((record) => typeof record.id === "string" ? [[record.id, record] as const] : []));
+  const transport = records.find((record) => record.type === "transport" && typeof record.selectedCandidatePairId === "string");
+  const selectedPairId = typeof transport?.selectedCandidatePairId === "string" ? transport.selectedCandidatePairId : undefined;
+  const selectedPair = (selectedPairId ? byId.get(selectedPairId) : undefined) ?? records
+    .filter((record) => record.type === "candidate-pair" && record.state === "succeeded" && (record.nominated === true || record.selected === true))
+    .sort((left, right) => safeStatNumber(right.bytesSent) - safeStatNumber(left.bytesSent))[0];
+  const localCandidate = typeof selectedPair?.localCandidateId === "string" ? byId.get(selectedPair.localCandidateId) : undefined;
+  const remoteCandidate = typeof selectedPair?.remoteCandidateId === "string" ? byId.get(selectedPair.remoteCandidateId) : undefined;
+
+  return {
+    channelState: channel?.readyState ?? "missing",
+    bufferedAmountBucket: byteSizeBucket(channel?.bufferedAmount ?? 0),
+    localRouteType: safeCandidateType(localCandidate?.candidateType),
+    remoteRouteType: safeCandidateType(remoteCandidate?.candidateType),
+    protocol: safeTransportName(localCandidate?.protocol),
+    relayProtocol: safeTransportName(localCandidate?.relayProtocol ?? remoteCandidate?.relayProtocol),
+    pairState: safePairState(selectedPair?.state),
+    nominated: selectedPair?.nominated === true,
+    bytesSentBucket: optionalByteSizeBucket(selectedPair?.bytesSent),
+    bytesReceivedBucket: optionalByteSizeBucket(selectedPair?.bytesReceived),
+    packetsSent: optionalStatNumber(selectedPair?.packetsSent),
+    packetsReceived: optionalStatNumber(selectedPair?.packetsReceived),
+    currentRoundTripTimeMs: optionalScaledStatNumber(selectedPair?.currentRoundTripTime, 1_000),
+    availableOutgoingBitrateKbps: optionalScaledStatNumber(selectedPair?.availableOutgoingBitrate, 0.001),
+  };
+}
+
+function safeCandidateType(value: unknown): string {
+  return value === "host" || value === "srflx" || value === "prflx" || value === "relay" ? value : "unknown";
+}
+
+function safeTransportName(value: unknown): string {
+  if (typeof value !== "string") return "unknown";
+  const normalized = value.toLowerCase();
+  return normalized === "udp" || normalized === "tcp" || normalized === "tls" ? normalized : "unknown";
+}
+
+function safePairState(value: unknown): string {
+  return value === "frozen" || value === "waiting" || value === "in-progress" || value === "failed" || value === "succeeded"
+    ? value
+    : "unknown";
+}
+
+function safeStatNumber(value: unknown): number {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? value : 0;
+}
+
+function optionalStatNumber(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value) : undefined;
+}
+
+function optionalByteSizeBucket(value: unknown): string | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? byteSizeBucket(value) : undefined;
+}
+
+function optionalScaledStatNumber(value: unknown, scale: number): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value >= 0 ? Math.round(value * scale) : undefined;
+}
+
+function byteSizeBucket(value: number): string {
+  if (!Number.isFinite(value) || value <= 0) return "0";
+  if (value < 256) return "1-255B";
+  if (value < 1_024) return "256B-1KiB";
+  if (value < 16 * 1_024) return "1-16KiB";
+  if (value < 128 * 1_024) return "16-128KiB";
+  if (value < 512 * 1_024) return "128-512KiB";
+  return "512KiB+";
+}
+
+function safeErrorName(error: unknown): string {
+  if (!(error instanceof Error)) return "UnknownError";
+  return /^[A-Za-z][A-Za-z0-9]{0,63}$/u.test(error.name) ? error.name : "Error";
 }
