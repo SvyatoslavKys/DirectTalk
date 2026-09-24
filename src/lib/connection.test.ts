@@ -1,6 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { base64UrlEncode, randomBytes } from "./encoding";
-import { DirectTalkConnection, parseAppPayload, summarizeTransportStats } from "./connection";
+import {
+  DirectTalkConnection,
+  parseAppPayload,
+  queryFreeTurnConfiguration,
+  summarizeTransportStats,
+} from "./connection";
 import { clearDiagnostics, getDiagnosticEntries } from "./diagnostics";
 import { MAX_PHOTO_BYTES, photoChunkCount } from "./photos";
 import { createIdentityKeys } from "./protocol";
@@ -41,6 +46,39 @@ describe("connection handshake", () => {
     await Promise.all([internal.sendHello(), internal.sendHello()]);
 
     expect(send).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe("ICE configuration compatibility", () => {
+  it("keeps query-free TURN aliases when a browser rejects transport query parameters", () => {
+    const configuration = queryFreeTurnConfiguration({
+      iceTransportPolicy: "relay",
+      iceServers: [
+        { urls: "stun:stun.example:3478" },
+        {
+          urls: [
+            "turn:relay.example:3478",
+            "turn:relay.example:3478?transport=udp",
+            "turns:relay.example:443",
+            "turns:relay.example:443?transport=tcp",
+          ],
+          username: "temporary-user",
+          credential: "temporary-password",
+        },
+      ],
+    });
+
+    expect(configuration).toEqual({
+      iceTransportPolicy: "relay",
+      iceServers: [
+        { urls: "stun:stun.example:3478" },
+        {
+          urls: ["turn:relay.example:3478", "turns:relay.example:443"],
+          username: "temporary-user",
+          credential: "temporary-password",
+        },
+      ],
+    });
   });
 });
 
@@ -169,6 +207,42 @@ describe("ICE recovery", () => {
       srflxCandidates: 1,
       relayCandidates: 0,
       relayConfigured: true,
+    });
+  });
+
+  it("summarizes ICE server errors per attempt without retaining server addresses", async () => {
+    const connection = await createTestConnection();
+    const internal = connection as unknown as {
+      recordIceCandidateError: (
+        event: Pick<RTCPeerConnectionIceErrorEvent, "errorCode" | "url">,
+      ) => void;
+      candidateSummaryDetails: () => Record<string, string | number | boolean>;
+      prepareLocalIceDescription: (description: RTCSessionDescriptionInit) => void;
+    };
+
+    internal.recordIceCandidateError({ errorCode: 701, url: "stun:stun.private.example:3478" });
+    internal.recordIceCandidateError({ errorCode: 701, url: "turn:203.0.113.9:80?transport=udp" });
+    internal.recordIceCandidateError({ errorCode: 438, url: "turn:203.0.113.9:80?transport=tcp" });
+    internal.recordIceCandidateError({ errorCode: 701, url: "turns:[2001:db8::1]:443?transport=tcp" });
+    internal.recordIceCandidateError({ errorCode: 701, url: "turn:relay.private.example:80" });
+
+    expect(internal.candidateSummaryDetails()).toMatchObject({
+      iceErrorCount: 5,
+      iceError701Count: 4,
+      iceErrorRoutes: "stun/unknown:1,turn/default:1,turn/tcp:1,turn/udp:1,turns/tls:1",
+    });
+    const storedDiagnostics = JSON.stringify(getDiagnosticEntries());
+    expect(storedDiagnostics).not.toContain("stun.private.example");
+    expect(storedDiagnostics).not.toContain("203.0.113.9");
+    expect(storedDiagnostics).not.toContain("2001:db8::1");
+    expect(storedDiagnostics).not.toContain("relay.private.example");
+
+    internal.prepareLocalIceDescription({ type: "offer", sdp: "v=0\r\na=ice-ufrag:new-attempt\r\n" });
+
+    expect(internal.candidateSummaryDetails()).toMatchObject({
+      iceErrorCount: 0,
+      iceError701Count: 0,
+      iceErrorRoutes: "none",
     });
   });
 

@@ -69,6 +69,9 @@ describe("diagnostic privacy", () => {
       bufferedAmountBucket: "0",
       urlScheme: "turns",
       transport: "tls",
+      iceErrorCount: 4,
+      iceError701Count: 3,
+      iceErrorRoutes: "stun/unknown:1,turn/udp:2,turns/tls:1",
     });
 
     expect(diagnostics.getDiagnosticEntries()).toEqual([
@@ -84,6 +87,9 @@ describe("diagnostic privacy", () => {
           bufferedAmountBucket: "0",
           urlScheme: "turns",
           transport: "tls",
+          iceErrorCount: 4,
+          iceError701Count: 3,
+          iceErrorRoutes: "stun/unknown:1,turn/udp:2,turns/tls:1",
         },
       }),
     ]);

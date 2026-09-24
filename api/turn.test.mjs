@@ -1,6 +1,7 @@
 import { createHmac } from "node:crypto";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
+  addSafariCompatibleTurnUrls,
   configuredProviders,
   createOpenRelayTestCredentials,
   extractIceServers,
@@ -27,6 +28,33 @@ const cloudflareServers = [
   },
 ];
 
+const safariCompatibleMeteredServers = [
+  { urls: "stun:stun.relay.metered.ca:80" },
+  {
+    urls: [
+      "turn:global.relay.metered.ca:80",
+      "turns:global.relay.metered.ca:443",
+      "turns:global.relay.metered.ca:443?transport=tcp",
+    ],
+    username: "temporary-user",
+    credential: "temporary-password",
+  },
+];
+
+const safariCompatibleCloudflareServers = [
+  { urls: "stun:stun.cloudflare.com:3478" },
+  {
+    urls: [
+      "turn:turn.cloudflare.com:3478",
+      "turn:turn.cloudflare.com:3478?transport=udp",
+      "turns:turn.cloudflare.com:443",
+      "turns:turn.cloudflare.com:443?transport=tcp",
+    ],
+    username: "cloudflare-temporary-user",
+    credential: "cloudflare-temporary-password",
+  },
+];
+
 afterEach(() => {
   vi.unstubAllEnvs();
 });
@@ -38,6 +66,10 @@ describe("Metered TURN response handling", () => {
 
   it("keeps compatibility with an object containing iceServers", () => {
     expect(extractIceServers({ iceServers: meteredServers })).toEqual(meteredServers);
+  });
+
+  it("adds query-free TURN aliases without removing explicit transports", () => {
+    expect(addSafariCompatibleTurnUrls(cloudflareServers)).toEqual(safariCompatibleCloudflareServers);
   });
 
   it("allows only the expected Metered credentials endpoint", () => {
@@ -62,8 +94,12 @@ describe("Metered TURN response handling", () => {
     expect(turnServer.credential).toBe(
       createHmac("sha1", "openrelayprojectsecret").update("1700003600").digest("base64"),
     );
-    expect(turnServer.urls).toContain("turn:staticauth.openrelay.metered.ca:80?transport=udp");
-    expect(turnServer.urls).toContain("turns:staticauth.openrelay.metered.ca:443?transport=tcp");
+    expect(turnServer.urls).toEqual([
+      "turn:staticauth.openrelay.metered.ca:80",
+      "turn:staticauth.openrelay.metered.ca:80?transport=tcp",
+      "turn:staticauth.openrelay.metered.ca:443?transport=tcp",
+      "turns:staticauth.openrelay.metered.ca:443",
+    ]);
   });
 
   it("deduplicates ICE URLs within and across server entries", () => {
@@ -88,7 +124,7 @@ describe("Metered TURN response handling", () => {
 
   it("rejects oversized per-server and per-provider ICE URL lists", () => {
     expect(() => sanitizeIceServers([{
-      urls: Array.from({ length: 9 }, (_, index) => `turn:server-${index}.example:3478`),
+      urls: Array.from({ length: 11 }, (_, index) => `turn:server-${index}.example:3478`),
     }])).toThrow("Too many ICE URLs");
     expect(() => sanitizeIceServers([
       { urls: Array.from({ length: 7 }, (_, index) => `turn:first-${index}.example:3478`) },
@@ -144,9 +180,14 @@ describe("TURN provider aggregation", () => {
     expect(result).toEqual({
       provider: "metered+cloudflare",
       iceServers: [
-        ...meteredServers,
-        { urls: ["turn:global.relay.metered.ca:443?transport=tcp"] },
-        ...cloudflareServers,
+        ...safariCompatibleMeteredServers,
+        {
+          urls: [
+            "turn:global.relay.metered.ca:443",
+            "turn:global.relay.metered.ca:443?transport=tcp",
+          ],
+        },
+        ...safariCompatibleCloudflareServers,
       ],
     });
     expect(metered.credentials).toHaveBeenCalledWith(1_234);
@@ -161,7 +202,7 @@ describe("TURN provider aggregation", () => {
 
     await expect(resolveProviderCredentials([metered, cloudflare])).resolves.toEqual({
       provider: "cloudflare",
-      iceServers: cloudflareServers,
+      iceServers: safariCompatibleCloudflareServers,
       ttl: 21_600,
     });
     expect(metered.credentials).toHaveBeenCalledWith(4_000);
@@ -174,7 +215,7 @@ describe("TURN provider aggregation", () => {
 
     await expect(resolveProviderCredentials([metered, cloudflare])).resolves.toEqual({
       provider: "metered",
-      iceServers: meteredServers,
+      iceServers: safariCompatibleMeteredServers,
     });
   });
 
@@ -184,7 +225,7 @@ describe("TURN provider aggregation", () => {
 
     await expect(resolveProviderCredentials([metered, cloudflare])).resolves.toEqual({
       provider: "cloudflare",
-      iceServers: cloudflareServers,
+      iceServers: safariCompatibleCloudflareServers,
     });
   });
 

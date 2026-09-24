@@ -6,7 +6,7 @@ const RATE_LIMIT_WINDOW_SECONDS = 60 * 60;
 const RATE_LIMIT_REQUESTS = 24;
 const PROVIDER_REQUEST_TIMEOUT_MS = 4_000;
 const MAX_ICE_SERVERS_PER_PROVIDER = 8;
-const MAX_ICE_URLS_PER_SERVER = 8;
+const MAX_ICE_URLS_PER_SERVER = 10;
 const MAX_ICE_URLS_PER_PROVIDER = 12;
 const MAX_COMBINED_ICE_SERVERS = 16;
 const MAX_COMBINED_ICE_URLS = 24;
@@ -53,7 +53,7 @@ async function resolveProviderCredentials(providers, timeout = PROVIDER_REQUEST_
   const results = await Promise.all(providers.map(async (provider) => {
     try {
       const result = await provider.credentials(timeout);
-      const iceServers = sanitizeIceServers(result.iceServers);
+      const iceServers = addSafariCompatibleTurnUrls(sanitizeIceServers(result.iceServers));
       if (!iceServers.some(hasTurnUrl)) return null;
       return {
         name: provider.name,
@@ -125,10 +125,10 @@ function createOpenRelayTestCredentials(nowSeconds = Math.floor(Date.now() / 1_0
       { urls: "stun:stun.relay.metered.ca:80" },
       {
         urls: [
-          `turn:${OPEN_RELAY_STATIC_AUTH_HOST}:80?transport=udp`,
+          `turn:${OPEN_RELAY_STATIC_AUTH_HOST}:80`,
           `turn:${OPEN_RELAY_STATIC_AUTH_HOST}:80?transport=tcp`,
           `turn:${OPEN_RELAY_STATIC_AUTH_HOST}:443?transport=tcp`,
-          `turns:${OPEN_RELAY_STATIC_AUTH_HOST}:443?transport=tcp`,
+          `turns:${OPEN_RELAY_STATIC_AUTH_HOST}:443`,
         ],
         username,
         credential,
@@ -291,6 +291,46 @@ function sanitizeIceServers(value) {
   return iceServers;
 }
 
+function addSafariCompatibleTurnUrls(iceServers) {
+  const originalUrlCount = iceServers.reduce(
+    (count, server) => count + (typeof server.urls === "string" ? 1 : server.urls.length),
+    0,
+  );
+  let providerAliasCapacity = Math.max(0, MAX_ICE_URLS_PER_PROVIDER - originalUrlCount);
+  const seenUrls = new Set(iceServers.flatMap((server) => {
+    const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
+    return urls.map((url) => iceUrlDedupeKey(url, server));
+  }));
+
+  return iceServers.map((server) => {
+    const originalUrls = typeof server.urls === "string" ? [server.urls] : server.urls;
+    let serverAliasCapacity = Math.max(0, MAX_ICE_URLS_PER_SERVER - originalUrls.length);
+    const urls = [];
+    for (const url of originalUrls) {
+      const alias = safariCompatibleTurnUrl(url);
+      const aliasKey = alias ? iceUrlDedupeKey(alias, server) : "";
+      if (
+        alias &&
+        !seenUrls.has(aliasKey) &&
+        serverAliasCapacity > 0 &&
+        providerAliasCapacity > 0
+      ) {
+        urls.push(alias);
+        seenUrls.add(aliasKey);
+        serverAliasCapacity -= 1;
+        providerAliasCapacity -= 1;
+      }
+      urls.push(url);
+    }
+    return { ...server, urls: typeof server.urls === "string" && urls.length === 1 ? urls[0] : urls };
+  });
+}
+
+function safariCompatibleTurnUrl(url) {
+  return url.match(/^(turn:[^?]+)\?transport=(?:udp|tcp)$/iu)?.[1] ??
+    url.match(/^(turns:[^?]+)\?transport=tcp$/iu)?.[1];
+}
+
 function sanitizeIceUrls(value) {
   const list = typeof value === "string" ? [value] : Array.isArray(value) ? value : [];
   if (list.length > MAX_ICE_URLS_PER_SERVER) throw new Error("Too many ICE URLs");
@@ -337,6 +377,7 @@ function hasTurnUrl(server) {
 }
 
 export {
+  addSafariCompatibleTurnUrls,
   configuredProviders,
   createOpenRelayTestCredentials,
   extractIceServers,

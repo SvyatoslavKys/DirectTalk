@@ -161,7 +161,7 @@ describe("rtcConfiguration", () => {
         json: async () => ({
           provider: "metered",
           iceServers: [{
-            urls: Array.from({ length: 9 }, (_, index) => `turn:relay-${index}.example:3478`),
+            urls: Array.from({ length: 11 }, (_, index) => `turn:relay-${index}.example:3478`),
             username: "user",
             credential: "credential",
           }],
@@ -179,6 +179,30 @@ describe("rtcConfiguration", () => {
       { reason: "Error: Too many TURN URLs" },
       "warn",
     );
+  });
+
+  it("accepts the server maximum produced by TURN compatibility aliases", async () => {
+    const urls = Array.from({ length: 10 }, (_, index) => `turn:relay-${index}.example:3478`);
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          provider: "cloudflare",
+          iceServers: [{ urls, username: "user", credential: "credential" }],
+        }),
+      }),
+    );
+
+    const configuration = await rtcConfiguration();
+
+    expect(configuration.iceServers?.[0]).toEqual({ urls, username: "user", credential: "credential" });
+    expect(logDiagnostic).toHaveBeenCalledWith("turn", "credentials-ready", {
+      provider: "cloudflare",
+      serverCount: 2,
+      relayConfigured: true,
+    });
   });
 
   it("preserves a shared TURN URL when provider credentials differ", async () => {

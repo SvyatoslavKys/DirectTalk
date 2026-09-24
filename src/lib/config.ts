@@ -2,7 +2,7 @@ import { logDiagnostic, safeErrorText } from "./diagnostics";
 
 const TURN_ENDPOINT_TIMEOUT_MS = 9_000;
 const MAX_TURN_ICE_SERVERS = 16;
-const MAX_TURN_URLS_PER_SERVER = 8;
+const MAX_TURN_URLS_PER_SERVER = 10;
 const MAX_TURN_URLS_TOTAL = 24;
 
 export function signalingUrl(): string {

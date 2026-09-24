@@ -135,6 +135,9 @@ export class DirectTalkConnection {
   private remoteCandidateCount = 0;
   private localCandidateTypes = createCandidateCounters();
   private candidateSummaryLogged = false;
+  private iceErrorCount = 0;
+  private iceError701Count = 0;
+  private iceErrorRoutes = new Map<string, number>();
   private localIceComplete = false;
   private remoteIceComplete = false;
   private iceGeneration?: string;
@@ -144,6 +147,7 @@ export class DirectTalkConnection {
   private localDescriptionSignaled = false;
   private pendingLocalCandidates: RTCIceCandidateInit[] = [];
   private relayConfigured = false;
+  private queryFreeTurnUrls = false;
   private txPackets = 0;
   private rxPackets = 0;
   private rtcConfig?: RTCConfiguration;
@@ -173,7 +177,9 @@ export class DirectTalkConnection {
   }
 
   private applyRtcConfiguration(configuration: RTCConfiguration): void {
-    this.rtcConfig = configuration;
+    this.rtcConfig = this.queryFreeTurnUrls
+      ? queryFreeTurnConfiguration(configuration) ?? configuration
+      : configuration;
     const serverCount = this.rtcConfig.iceServers?.length ?? 0;
     this.relayConfigured = this.rtcConfig.iceServers?.some((server) => {
       const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
@@ -297,7 +303,18 @@ export class DirectTalkConnection {
     if (!this.rtcConfig) throw new Error("WebRTC configuration is not ready");
     const generation = ++this.peerGeneration;
     this.trace("peer-created", { generation });
-    const peerConnection = new RTCPeerConnection(this.rtcConfig);
+    let peerConnection: RTCPeerConnection;
+    try {
+      peerConnection = new RTCPeerConnection(this.rtcConfig);
+    } catch (error) {
+      if (safeErrorName(error) !== "SyntaxError") throw error;
+      const fallback = queryFreeTurnConfiguration(this.rtcConfig);
+      if (!fallback) throw error;
+      this.queryFreeTurnUrls = true;
+      this.rtcConfig = fallback;
+      this.trace("turn-query-fallback-applied", undefined, "warn");
+      peerConnection = new RTCPeerConnection(fallback);
+    }
     this.peerConnection = peerConnection;
 
     peerConnection.addEventListener("icecandidate", (event) => {
@@ -306,13 +323,7 @@ export class DirectTalkConnection {
     });
     peerConnection.addEventListener("icecandidateerror", (rawEvent) => {
       if (generation !== this.peerGeneration) return;
-      const event = rawEvent as RTCPeerConnectionIceErrorEvent;
-      const server = safeIceServerDescriptor(event.url);
-      this.trace("ice-candidate-error", {
-        errorCode: event.errorCode,
-        urlScheme: server.urlScheme,
-        transport: server.transport,
-      }, "warn");
+      this.recordIceCandidateError(rawEvent as RTCPeerConnectionIceErrorEvent);
     });
     peerConnection.addEventListener("icegatheringstatechange", () => {
       if (generation !== this.peerGeneration) return;
@@ -492,9 +503,7 @@ export class DirectTalkConnection {
     this.recoveryOfferStarted = true;
     this.recoveryNegotiated = false;
     this.awaitingRecoveryRemoteDescription = true;
-    this.localCandidateCount = 0;
-    this.localCandidateTypes = createCandidateCounters();
-    this.candidateSummaryLogged = false;
+    this.resetIceAttemptDiagnostics();
     this.trace("ice-recovery-offer-creating", { attempt: this.recoveryAttempts });
     const peerConnection = this.requirePeerConnection();
     const offer = await peerConnection.createOffer({ iceRestart: true });
@@ -611,9 +620,7 @@ export class DirectTalkConnection {
 
     if (description.type === "offer") {
       if (this.recovering) {
-        this.localCandidateCount = 0;
-        this.localCandidateTypes = createCandidateCounters();
-        this.candidateSummaryLogged = false;
+        this.resetIceAttemptDiagnostics();
       }
       const answer = await peerConnection.createAnswer();
       if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return;
@@ -916,6 +923,7 @@ export class DirectTalkConnection {
       return Promise.resolve(false);
     }
     this.initialIceAttempt += 1;
+    this.resetIceAttemptDiagnostics();
     this.initialIceRetryActive = true;
     const initialIceRetryGeneration = ++this.initialIceRetryGeneration;
     const peerGeneration = this.peerGeneration;
@@ -959,7 +967,7 @@ export class DirectTalkConnection {
     if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return false;
     this.initialIceRefreshPending = false;
     this.applyRtcConfiguration(configuration);
-    peerConnection.setConfiguration(configuration);
+    peerConnection.setConfiguration(this.rtcConfig ?? configuration);
     if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return false;
 
     this.pendingCandidates = [];
@@ -1060,6 +1068,7 @@ export class DirectTalkConnection {
 
     this.recovering = true;
     this.recoveryAttempts += 1;
+    this.resetIceAttemptDiagnostics();
     this.recoveryGeneration += 1;
     this.recoveryOfferStarted = false;
     this.recoveryNegotiated = false;
@@ -1112,7 +1121,11 @@ export class DirectTalkConnection {
     this.localDescriptionSignaled = false;
     this.pendingLocalCandidates = [];
     const recoveryGeneration = ++this.recoveryGeneration;
-    this.trace("ice-recovery-attempt-failed", { attempt: this.recoveryAttempts, trigger }, "warn");
+    this.trace("ice-recovery-attempt-failed", {
+      attempt: this.recoveryAttempts,
+      trigger,
+      ...this.candidateSummaryDetails(),
+    }, "warn");
     this.closeSignalingSocket("recovery-retry");
 
     if (this.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
@@ -1282,12 +1295,34 @@ export class DirectTalkConnection {
     else this.pendingLocalCandidates.push(candidateInit);
   }
 
-  private prepareLocalIceDescription(description: RTCSessionDescriptionInit): void {
-    this.localIceDescriptionReady = true;
-    this.localIceUsernameFragments = iceUsernameFragments(description.sdp);
+  private recordIceCandidateError(
+    event: Pick<RTCPeerConnectionIceErrorEvent, "errorCode" | "url">,
+  ): void {
+    const server = safeIceServerDescriptor(event.url);
+    const route = `${server.urlScheme}/${server.transport}`;
+    this.iceErrorCount += 1;
+    if (event.errorCode === 701) this.iceError701Count += 1;
+    this.iceErrorRoutes.set(route, (this.iceErrorRoutes.get(route) ?? 0) + 1);
+    this.trace("ice-candidate-error", {
+      errorCode: event.errorCode,
+      urlScheme: server.urlScheme,
+      transport: server.transport,
+    }, "warn");
+  }
+
+  private resetIceAttemptDiagnostics(): void {
     this.localCandidateCount = 0;
     this.localCandidateTypes = createCandidateCounters();
     this.candidateSummaryLogged = false;
+    this.iceErrorCount = 0;
+    this.iceError701Count = 0;
+    this.iceErrorRoutes.clear();
+  }
+
+  private prepareLocalIceDescription(description: RTCSessionDescriptionInit): void {
+    this.localIceDescriptionReady = true;
+    this.localIceUsernameFragments = iceUsernameFragments(description.sdp);
+    this.resetIceAttemptDiagnostics();
     this.localIceComplete = false;
     this.localDescriptionSignaled = false;
     this.pendingLocalCandidates = [];
@@ -1344,6 +1379,9 @@ export class DirectTalkConnection {
     prflxCandidates: number;
     relayCandidates: number;
     relayConfigured: boolean;
+    iceErrorCount: number;
+    iceError701Count: number;
+    iceErrorRoutes: string;
   } {
     return {
       count: this.localCandidateCount,
@@ -1352,6 +1390,12 @@ export class DirectTalkConnection {
       prflxCandidates: this.localCandidateTypes.prflx,
       relayCandidates: this.localCandidateTypes.relay,
       relayConfigured: this.relayConfigured,
+      iceErrorCount: this.iceErrorCount,
+      iceError701Count: this.iceError701Count,
+      iceErrorRoutes: [...this.iceErrorRoutes.entries()]
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([route, count]) => `${route}:${count}`)
+        .join(",") || "none",
     };
   }
 
@@ -1411,10 +1455,8 @@ export class DirectTalkConnection {
     this.receivedSessionReady = false;
     this.offerStarted = false;
     this.pendingCandidates = [];
-    this.localCandidateCount = 0;
     this.remoteCandidateCount = 0;
-    this.localCandidateTypes = createCandidateCounters();
-    this.candidateSummaryLogged = false;
+    this.resetIceAttemptDiagnostics();
     this.localIceComplete = false;
     this.remoteIceComplete = false;
     this.iceGeneration = undefined;
@@ -1686,8 +1728,31 @@ function safeIceServerDescriptor(rawUrl: string | null | undefined): { urlScheme
   const value = typeof rawUrl === "string" ? rawUrl : "";
   const urlScheme = value.match(/^(stun|stuns|turn|turns):/iu)?.[1]?.toLowerCase() ?? "unknown";
   const queryTransport = value.match(/[?&]transport=(udp|tcp)(?:&|$)/iu)?.[1]?.toLowerCase();
-  const transport = queryTransport ?? (urlScheme === "turns" ? "tls" : "unknown");
+  const transport = urlScheme === "turns"
+    ? "tls"
+    : queryTransport ?? (urlScheme === "turn" ? "default" : "unknown");
   return { urlScheme, transport };
+}
+
+export function queryFreeTurnConfiguration(configuration: RTCConfiguration): RTCConfiguration | undefined {
+  let removedQueryUrl = false;
+  const iceServers = (configuration.iceServers ?? []).flatMap((server) => {
+    const originalUrls = typeof server.urls === "string" ? [server.urls] : server.urls;
+    const urls = originalUrls.filter((url) => {
+      const remove = /^(?:turn|turns):[^?]+\?/iu.test(url);
+      if (remove) removedQueryUrl = true;
+      return !remove;
+    });
+    if (!urls.length) return [];
+    return [{ ...server, urls: typeof server.urls === "string" && urls.length === 1 ? urls[0] : urls }];
+  });
+  if (!removedQueryUrl || !iceServers.some((server) => {
+    const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
+    return urls.some((url) => /^(?:turn|turns):/iu.test(url));
+  })) {
+    return undefined;
+  }
+  return { ...configuration, iceServers };
 }
 
 export function summarizeTransportStats(
