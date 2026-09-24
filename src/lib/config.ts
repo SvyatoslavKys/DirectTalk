@@ -1,5 +1,10 @@
 import { logDiagnostic, safeErrorText } from "./diagnostics";
 
+const TURN_ENDPOINT_TIMEOUT_MS = 9_000;
+const MAX_TURN_ICE_SERVERS = 16;
+const MAX_TURN_URLS_PER_SERVER = 8;
+const MAX_TURN_URLS_TOTAL = 24;
+
 export function signalingUrl(): string {
   const configured = import.meta.env.VITE_SIGNALING_URL?.trim();
   if (configured) return validateWebSocketUrl(configured);
@@ -22,7 +27,7 @@ export async function rtcConfiguration(): Promise<RTCConfiguration> {
 
   try {
     const controller = new AbortController();
-    const timeout = window.setTimeout(() => controller.abort(), 8_000);
+    const timeout = window.setTimeout(() => controller.abort(), TURN_ENDPOINT_TIMEOUT_MS);
     let response: Response;
     try {
       response = await fetch("/api/turn", {
@@ -68,15 +73,17 @@ function parseTurnResponse(value: unknown): { iceServers: RTCIceServer[]; provid
   if (!value || typeof value !== "object") throw new Error("Invalid TURN response");
   const payload = value as { iceServers?: unknown; provider?: unknown };
   const rawServers = payload.iceServers;
-  if (!Array.isArray(rawServers) || rawServers.length < 1 || rawServers.length > 12) {
+  if (!Array.isArray(rawServers) || rawServers.length < 1 || rawServers.length > MAX_TURN_ICE_SERVERS) {
     throw new Error("Invalid TURN server list");
   }
 
-  const iceServers = rawServers.map((raw): RTCIceServer => {
+  const seenUrls = new Set<string>();
+  let urlCount = 0;
+  const iceServers: RTCIceServer[] = [];
+  for (const raw of rawServers) {
     if (!raw || typeof raw !== "object") throw new Error("Invalid TURN server");
     const server = raw as Record<string, unknown>;
-    const urls = parseIceUrls(server.urls);
-    const result: RTCIceServer = { urls };
+    const result: RTCIceServer = { urls: [] };
     if (server.username !== undefined) {
       if (typeof server.username !== "string" || server.username.length > 512) throw new Error("Invalid TURN username");
       result.username = server.username;
@@ -85,10 +92,24 @@ function parseTurnResponse(value: unknown): { iceServers: RTCIceServer[]; provid
       if (typeof server.credential !== "string" || server.credential.length > 1_024) throw new Error("Invalid TURN credential");
       result.credential = server.credential;
     }
-    return result;
-  });
+    const urls = parseIceUrls(server.urls).filter((url) => {
+      const key = iceUrlDedupeKey(url, result);
+      if (seenUrls.has(key)) return false;
+      seenUrls.add(key);
+      return true;
+    });
+    if (!urls.length) continue;
+    urlCount += urls.length;
+    if (urlCount > MAX_TURN_URLS_TOTAL) throw new Error("Too many TURN URLs");
+    result.urls = typeof server.urls === "string" ? urls[0] : urls;
+    iceServers.push(result);
+  }
+  if (!iceServers.length) throw new Error("Invalid TURN server list");
   const provider =
-    payload.provider === "metered" || payload.provider === "cloudflare" || payload.provider === "open-relay-test"
+    payload.provider === "metered" ||
+    payload.provider === "cloudflare" ||
+    payload.provider === "metered+cloudflare" ||
+    payload.provider === "open-relay-test"
       ? payload.provider
       : "unknown";
   return { iceServers, provider };
@@ -96,6 +117,8 @@ function parseTurnResponse(value: unknown): { iceServers: RTCIceServer[]; provid
 
 function addFallbackIceServers(iceServers: RTCIceServer[], fallback: RTCIceServer[]): RTCIceServer[] {
   const configuredUrls = new Set(iceServers.flatMap((server) => iceServerUrls(server)));
+  const configuredUrlCount = iceServers.reduce((count, server) => count + iceServerUrls(server).length, 0);
+  if (iceServers.length >= MAX_TURN_ICE_SERVERS || configuredUrlCount >= MAX_TURN_URLS_TOTAL) return iceServers;
   const missingFallback = fallback.filter((server) =>
     iceServerUrls(server).some((url) => !configuredUrls.has(url)),
   );
@@ -106,15 +129,22 @@ function iceServerUrls(server: RTCIceServer): string[] {
   return typeof server.urls === "string" ? [server.urls] : server.urls;
 }
 
-function parseIceUrls(value: unknown): string | string[] {
+function parseIceUrls(value: unknown): string[] {
   const urls = typeof value === "string" ? [value] : Array.isArray(value) ? value : [];
-  const safeUrls = urls.filter((url): url is string => {
+  if (urls.length > MAX_TURN_URLS_PER_SERVER) throw new Error("Too many TURN URLs");
+  const safeUrls = [...new Set(urls.filter((url): url is string => {
     if (typeof url !== "string" || url.length > 1_024) return false;
     if (!/^(?:stun|turn|turns):/iu.test(url)) return false;
     return !/:(?:53)(?:\?|$)/u.test(url);
-  });
+  }))];
   if (!safeUrls.length) throw new Error("TURN server has no supported URLs");
-  return typeof value === "string" ? safeUrls[0] : safeUrls;
+  return safeUrls;
+}
+
+function iceUrlDedupeKey(url: string, server: RTCIceServer): string {
+  return /^stun:/iu.test(url)
+    ? url
+    : JSON.stringify([url, server.username ?? null, server.credential ?? null]);
 }
 
 function hasTurnUrl(server: RTCIceServer): boolean {

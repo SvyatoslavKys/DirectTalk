@@ -4,8 +4,12 @@ import Redis from "ioredis";
 const CLOUDFLARE_ENDPOINT = "https://rtc.live.cloudflare.com/v1/turn/keys";
 const RATE_LIMIT_WINDOW_SECONDS = 60 * 60;
 const RATE_LIMIT_REQUESTS = 24;
-const PROVIDER_DEADLINE_MS = 8_000;
-const PROVIDER_REQUEST_TIMEOUT_MS = 5_000;
+const PROVIDER_REQUEST_TIMEOUT_MS = 4_000;
+const MAX_ICE_SERVERS_PER_PROVIDER = 8;
+const MAX_ICE_URLS_PER_SERVER = 8;
+const MAX_ICE_URLS_PER_PROVIDER = 12;
+const MAX_COMBINED_ICE_SERVERS = 16;
+const MAX_COMBINED_ICE_URLS = 24;
 const OPEN_RELAY_STATIC_AUTH_HOST = "staticauth.openrelay.metered.ca";
 const OPEN_RELAY_STATIC_AUTH_SECRET = "openrelayprojectsecret";
 const OPEN_RELAY_TEST_TTL_SECONDS = 60 * 60;
@@ -37,27 +41,39 @@ export default async function handler(request, response) {
     const allowed = await consumeRateLimit(request, providers[0].rateLimitSecret);
     if (!allowed) return sendJson(response, 429, { error: "rate-limit-exceeded" });
 
-    const deadline = Date.now() + PROVIDER_DEADLINE_MS;
-    for (const provider of providers) {
-      try {
-        const remaining = deadline - Date.now();
-        if (remaining <= 0) break;
-        const result = await provider.credentials(Math.min(PROVIDER_REQUEST_TIMEOUT_MS, remaining));
-        const iceServers = sanitizeIceServers(result.iceServers);
-        if (!iceServers.some(hasTurnUrl)) throw new Error("TURN response has no relay server");
-        return sendJson(response, 200, {
-          iceServers,
-          provider: provider.name,
-          ...(result.ttl ? { ttl: result.ttl } : {}),
-        });
-      } catch {
-        // Try the next configured provider without logging credentials or response bodies.
-      }
-    }
-    return sendJson(response, 502, { error: "turn-provider-unavailable" });
+    const providerResponse = await resolveProviderCredentials(providers);
+    if (!providerResponse) return sendJson(response, 502, { error: "turn-provider-unavailable" });
+    return sendJson(response, 200, providerResponse);
   } catch {
     return sendJson(response, 503, { error: "turn-temporarily-unavailable" });
   }
+}
+
+async function resolveProviderCredentials(providers, timeout = PROVIDER_REQUEST_TIMEOUT_MS) {
+  const results = await Promise.all(providers.map(async (provider) => {
+    try {
+      const result = await provider.credentials(timeout);
+      const iceServers = sanitizeIceServers(result.iceServers);
+      if (!iceServers.some(hasTurnUrl)) return null;
+      return {
+        name: provider.name,
+        iceServers,
+        ttl: validCredentialTtl(result.ttl),
+      };
+    } catch {
+      // Provider errors and response bodies can contain secrets, so do not log them.
+      return null;
+    }
+  }));
+  const successful = results.filter(Boolean);
+  if (!successful.length) return null;
+
+  const ttl = successful.length === 1 ? successful[0].ttl : undefined;
+  return {
+    iceServers: combineIceServers(successful.flatMap((result) => result.iceServers)),
+    provider: successful.map((result) => result.name).join("+"),
+    ...(ttl ? { ttl } : {}),
+  };
 }
 
 function configuredProviders() {
@@ -238,34 +254,81 @@ function credentialTtlSeconds() {
   return Math.max(MIN_CREDENTIAL_TTL_SECONDS, Math.min(MAX_CREDENTIAL_TTL_SECONDS, Math.trunc(configured)));
 }
 
+function validCredentialTtl(value) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.trunc(value) : undefined;
+}
+
 function sanitizeIceServers(value) {
-  if (!Array.isArray(value) || value.length < 1 || value.length > 12) throw new Error("Invalid ICE server list");
-  return value.map((server) => {
+  if (!Array.isArray(value) || value.length < 1 || value.length > MAX_ICE_SERVERS_PER_PROVIDER) {
+    throw new Error("Invalid ICE server list");
+  }
+  const seenUrls = new Set();
+  let urlCount = 0;
+  const iceServers = [];
+  for (const server of value) {
     if (!server || typeof server !== "object") throw new Error("Invalid ICE server");
-    const urls = sanitizeIceUrls(server.urls);
-    const result = { urls };
+    const credentials = {};
     if (server.username !== undefined) {
       if (typeof server.username !== "string" || server.username.length > 512) throw new Error("Invalid TURN username");
-      result.username = server.username;
+      credentials.username = server.username;
     }
     if (server.credential !== undefined) {
       if (typeof server.credential !== "string" || server.credential.length > 1_024) throw new Error("Invalid TURN credential");
-      result.credential = server.credential;
+      credentials.credential = server.credential;
     }
-    return result;
-  });
+    const urls = sanitizeIceUrls(server.urls).filter((url) => {
+      const key = iceUrlDedupeKey(url, credentials);
+      if (seenUrls.has(key)) return false;
+      seenUrls.add(key);
+      return true;
+    });
+    if (!urls.length) continue;
+    urlCount += urls.length;
+    if (urlCount > MAX_ICE_URLS_PER_PROVIDER) throw new Error("Too many ICE URLs");
+    iceServers.push({ urls: typeof server.urls === "string" ? urls[0] : urls, ...credentials });
+  }
+  if (!iceServers.length) throw new Error("Invalid ICE server list");
+  return iceServers;
 }
 
 function sanitizeIceUrls(value) {
   const list = typeof value === "string" ? [value] : Array.isArray(value) ? value : [];
-  const safe = list.filter((url) =>
+  if (list.length > MAX_ICE_URLS_PER_SERVER) throw new Error("Too many ICE URLs");
+  const safe = [...new Set(list.filter((url) =>
     typeof url === "string" &&
-    url.length <= 1_024 &&
-    /^(?:stun|turn|turns):/iu.test(url) &&
-    !/:(?:53)(?:\?|$)/u.test(url),
-  );
+      url.length <= 1_024 &&
+      /^(?:stun|turn|turns):/iu.test(url) &&
+      !/:(?:53)(?:\?|$)/u.test(url),
+  ))];
   if (!safe.length) throw new Error("No supported ICE URLs");
-  return typeof value === "string" ? safe[0] : safe;
+  return safe;
+}
+
+function combineIceServers(iceServers) {
+  if (iceServers.length > MAX_COMBINED_ICE_SERVERS) throw new Error("Too many combined ICE servers");
+  const seenUrls = new Set();
+  const combined = [];
+  let urlCount = 0;
+  for (const server of iceServers) {
+    const urls = (typeof server.urls === "string" ? [server.urls] : server.urls).filter((url) => {
+      const key = iceUrlDedupeKey(url, server);
+      if (seenUrls.has(key)) return false;
+      seenUrls.add(key);
+      return true;
+    });
+    if (!urls.length) continue;
+    urlCount += urls.length;
+    if (urlCount > MAX_COMBINED_ICE_URLS) throw new Error("Too many combined ICE URLs");
+    combined.push({ ...server, urls: typeof server.urls === "string" ? urls[0] : urls });
+  }
+  if (!combined.length) throw new Error("No combined ICE servers");
+  return combined;
+}
+
+function iceUrlDedupeKey(url, server) {
+  return /^stun:/iu.test(url)
+    ? url
+    : JSON.stringify([url, server.username ?? null, server.credential ?? null]);
 }
 
 function hasTurnUrl(server) {
@@ -273,4 +336,11 @@ function hasTurnUrl(server) {
   return urls.some((url) => /^(?:turn|turns):/iu.test(url));
 }
 
-export { createOpenRelayTestCredentials, extractIceServers, sanitizeIceServers, validateMeteredCredentialsUrl };
+export {
+  configuredProviders,
+  createOpenRelayTestCredentials,
+  extractIceServers,
+  resolveProviderCredentials,
+  sanitizeIceServers,
+  validateMeteredCredentialsUrl,
+};

@@ -1,6 +1,7 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { base64UrlEncode, randomBytes } from "./encoding";
 import { DirectTalkConnection, parseAppPayload, summarizeTransportStats } from "./connection";
+import { clearDiagnostics, getDiagnosticEntries } from "./diagnostics";
 import { MAX_PHOTO_BYTES, photoChunkCount } from "./photos";
 import { createIdentityKeys } from "./protocol";
 
@@ -9,6 +10,7 @@ const id = "123e4567-e89b-42d3-a456-426614174000";
 afterEach(() => {
   vi.useRealTimers();
   vi.unstubAllGlobals();
+  clearDiagnostics();
 });
 
 async function createTestConnection(role: "creator" | "joiner" = "creator") {
@@ -43,6 +45,291 @@ describe("connection handshake", () => {
 });
 
 describe("ICE recovery", () => {
+  it("refreshes TURN configuration and starts one initial ICE retry after the grace period", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", {
+      location: { hostname: "chat.example", protocol: "https:", host: "chat.example" },
+      setTimeout,
+      clearTimeout,
+    });
+    vi.stubGlobal("WebSocket", { OPEN: 1 });
+    const fetchMock = vi.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        provider: "metered",
+        iceServers: [{
+          urls: "turns:relay.example:443?transport=tcp",
+          username: "fresh-user",
+          credential: "fresh-credential",
+        }],
+      }),
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const connection = await createTestConnection("creator");
+    const offer = { type: "offer", sdp: "v=0\r\na=ice-ufrag:retry-fragment\r\n" } satisfies RTCSessionDescriptionInit;
+    const peerConnection = {
+      connectionState: "failed",
+      iceConnectionState: "failed",
+      signalingState: "stable",
+      iceGatheringState: "gathering",
+      localDescription: null as RTCSessionDescriptionInit | null,
+      getStats: vi.fn().mockResolvedValue(new Map()),
+      setConfiguration: vi.fn(),
+      createOffer: vi.fn().mockResolvedValue(offer),
+      setLocalDescription: vi.fn().mockImplementation(async (description: RTCSessionDescriptionInit) => {
+        peerConnection.localDescription = description;
+      }),
+    };
+    const channel = { readyState: "connecting", close: vi.fn() };
+    const socket = { readyState: 1, send: vi.fn(), close: vi.fn() };
+    Object.assign(connection, { peerConnection, dataChannel: channel, socket, signalingPeerReady: true });
+    const internal = connection as unknown as {
+      handlePeerConnectionStateChange: (peer: RTCPeerConnection) => void;
+    };
+
+    internal.handlePeerConnectionStateChange(peerConnection as unknown as RTCPeerConnection);
+    await vi.advanceTimersByTimeAsync(1_499);
+    expect(fetchMock).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    await Promise.resolve();
+
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(peerConnection.setConfiguration).toHaveBeenCalledWith(expect.objectContaining({
+      iceServers: expect.arrayContaining([expect.objectContaining({ urls: "turns:relay.example:443?transport=tcp" })]),
+    }));
+    expect(peerConnection.createOffer).toHaveBeenCalledWith({ iceRestart: true });
+    expect(socket.send).toHaveBeenCalledTimes(1);
+    expect(socket.close).not.toHaveBeenCalled();
+    expect(channel.close).not.toHaveBeenCalled();
+    expect((connection as unknown as { initialIceAttempt: number }).initialIceAttempt).toBe(2);
+  });
+
+  it("cancels an initial disconnect retry when the route reconnects during grace", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+    vi.stubGlobal("WebSocket", { OPEN: 1 });
+    const connection = await createTestConnection();
+    const startInitialIceRetry = vi.fn();
+    const peerConnection = {
+      connectionState: "disconnected",
+      signalingState: "stable",
+      getStats: vi.fn().mockResolvedValue(new Map()),
+    };
+    Object.assign(connection, { peerConnection, startInitialIceRetry });
+    const internal = connection as unknown as {
+      handlePeerConnectionStateChange: (peer: RTCPeerConnection) => void;
+    };
+
+    internal.handlePeerConnectionStateChange(peerConnection as unknown as RTCPeerConnection);
+    peerConnection.connectionState = "connected";
+    internal.handlePeerConnectionStateChange(peerConnection as unknown as RTCPeerConnection);
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect(startInitialIceRetry).not.toHaveBeenCalled();
+  });
+
+  it("exhausts initial ICE retries after two restart attempts and records the candidate summary", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+    const connection = await createTestConnection();
+    const peerConnection = {
+      connectionState: "failed",
+      getStats: vi.fn().mockResolvedValue(new Map()),
+      close: vi.fn(),
+    };
+    const channel = { readyState: "connecting", close: vi.fn() };
+    const socket = { close: vi.fn() };
+    Object.assign(connection, {
+      peerConnection,
+      dataChannel: channel,
+      socket,
+      initialIceAttempt: 3,
+      relayConfigured: true,
+      localCandidateCount: 2,
+      localCandidateTypes: { host: 1, srflx: 1, prflx: 0, relay: 0, unknown: 0 },
+    });
+    const internal = connection as unknown as {
+      handlePeerConnectionStateChange: (peer: RTCPeerConnection) => void;
+    };
+
+    internal.handlePeerConnectionStateChange(peerConnection as unknown as RTCPeerConnection);
+    await vi.advanceTimersByTimeAsync(1_500);
+
+    expect((connection as unknown as { closed: boolean }).closed).toBe(true);
+    const entries = getDiagnosticEntries();
+    expect(entries.map((entry) => entry.event)).toEqual(expect.arrayContaining([
+      "initial-ice-candidate-summary",
+      "initial-ice-retry-failed",
+      "initial-ice-retry-exhausted",
+    ]));
+    expect(entries.find((entry) => entry.event === "initial-ice-candidate-summary")?.details).toMatchObject({
+      attempt: 3,
+      hostCandidates: 1,
+      srflxCandidates: 1,
+      relayCandidates: 0,
+      relayConfigured: true,
+    });
+  });
+
+  it("uses an attempt watchdog when a retry remains stuck without another state event", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+    const connection = await createTestConnection();
+    const startInitialIceRetry = vi.fn().mockResolvedValue(true);
+    const peerConnection = { connectionState: "connecting" };
+    Object.assign(connection, { peerConnection, startInitialIceRetry, initialIceRetryActive: true });
+    const internal = connection as unknown as {
+      armInitialIceAttemptTimer: (peer: RTCPeerConnection, generation: number) => void;
+    };
+
+    internal.armInitialIceAttemptTimer(peerConnection as unknown as RTCPeerConnection, 0);
+    await vi.advanceTimersByTimeAsync(18_000 + 1_499);
+    expect(startInitialIceRetry).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(1);
+    expect(startInitialIceRetry).toHaveBeenCalledWith("timeout", peerConnection);
+  });
+
+  it("invalidates a delayed credential refresh when the original route reconnects", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", {
+      location: { hostname: "chat.example", protocol: "https:", host: "chat.example" },
+      setTimeout,
+      clearTimeout,
+    });
+    vi.stubGlobal("WebSocket", { OPEN: 1 });
+    let resolveFetch!: (response: unknown) => void;
+    vi.stubGlobal("fetch", vi.fn().mockReturnValue(new Promise((resolve) => {
+      resolveFetch = resolve;
+    })));
+    const connection = await createTestConnection("creator");
+    const peerConnection = {
+      connectionState: "failed",
+      signalingState: "stable",
+      getStats: vi.fn().mockResolvedValue(new Map()),
+      setConfiguration: vi.fn(),
+      createOffer: vi.fn(),
+      close: vi.fn(),
+    };
+    Object.assign(connection, { peerConnection, dataChannel: { readyState: "connecting", close: vi.fn() } });
+    const internal = connection as unknown as {
+      startInitialIceRetry: (trigger: string, peer: RTCPeerConnection) => Promise<boolean>;
+      handlePeerConnectionStateChange: (peer: RTCPeerConnection) => void;
+      resetPeerConnection: () => void;
+    };
+
+    const retry = internal.startInitialIceRetry("failed", peerConnection as unknown as RTCPeerConnection);
+    await Promise.resolve();
+    peerConnection.connectionState = "connected";
+    internal.handlePeerConnectionStateChange(peerConnection as unknown as RTCPeerConnection);
+    resolveFetch({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        provider: "metered",
+        iceServers: [{ urls: "turns:relay.example:443", username: "user", credential: "credential" }],
+      }),
+    });
+    await retry;
+
+    expect(peerConnection.setConfiguration).not.toHaveBeenCalled();
+    expect(peerConnection.createOffer).not.toHaveBeenCalled();
+    internal.resetPeerConnection();
+    expect((connection as unknown as { initialIceAttempt: number }).initialIceAttempt).toBe(1);
+  });
+
+  it("waits for a passive joiner refresh before applying a restart offer", async () => {
+    vi.stubGlobal("WebSocket", { OPEN: 1 });
+    const connection = await createTestConnection("joiner");
+    let finishPreparation!: (prepared: boolean) => void;
+    const preparation = new Promise<boolean>((resolve) => {
+      finishPreparation = resolve;
+    });
+    const answer = { type: "answer", sdp: "v=0\r\na=ice-ufrag:new-local\r\n" } satisfies RTCSessionDescriptionInit;
+    const peerConnection = {
+      connectionState: "failed",
+      signalingState: "stable",
+      remoteDescription: { type: "offer", sdp: "old" },
+      localDescription: null as RTCSessionDescriptionInit | null,
+      setRemoteDescription: vi.fn().mockResolvedValue(undefined),
+      createAnswer: vi.fn().mockResolvedValue(answer),
+      setLocalDescription: vi.fn().mockImplementation(async (description: RTCSessionDescriptionInit) => {
+        peerConnection.localDescription = description;
+      }),
+      addIceCandidate: vi.fn(),
+    };
+    const socket = { readyState: 1, send: vi.fn() };
+    Object.assign(connection, {
+      peerConnection,
+      socket,
+      iceGeneration: "AbCdEfGhIjKlMn01",
+      initialIceRetryActive: true,
+      initialIcePreparation: preparation,
+    });
+    const internal = connection as unknown as {
+      handleRemoteDescription: (description: RTCSessionDescriptionInit, iceGeneration: string) => Promise<void>;
+    };
+
+    const applying = internal.handleRemoteDescription(
+      { type: "offer", sdp: "v=0\r\na=ice-ufrag:remote-new\r\n" },
+      "ZyXwVuTsRqPoNm10",
+    );
+    await Promise.resolve();
+    expect(peerConnection.setRemoteDescription).not.toHaveBeenCalled();
+    finishPreparation(true);
+    await applying;
+
+    expect(peerConnection.setRemoteDescription).toHaveBeenCalledTimes(1);
+    expect(peerConnection.createAnswer).toHaveBeenCalledTimes(1);
+    expect(socket.send).toHaveBeenCalledTimes(1);
+  });
+
+  it("still signals an answer when the restarted route connects during setLocalDescription", async () => {
+    vi.stubGlobal("WebSocket", { OPEN: 1 });
+    const connection = await createTestConnection("joiner");
+    const answer = { type: "answer", sdp: "v=0\r\na=ice-ufrag:new-local\r\n" } satisfies RTCSessionDescriptionInit;
+    let internal!: {
+      handleRemoteDescription: (description: RTCSessionDescriptionInit, iceGeneration: string) => Promise<void>;
+      handlePeerConnectionStateChange: (peer: RTCPeerConnection) => void;
+    };
+    const peerConnection = {
+      connectionState: "failed",
+      signalingState: "stable",
+      remoteDescription: { type: "offer", sdp: "old" },
+      localDescription: null as RTCSessionDescriptionInit | null,
+      getStats: vi.fn().mockResolvedValue(new Map()),
+      setRemoteDescription: vi.fn().mockResolvedValue(undefined),
+      createAnswer: vi.fn().mockResolvedValue(answer),
+      setLocalDescription: vi.fn().mockImplementation(async (description: RTCSessionDescriptionInit) => {
+        peerConnection.localDescription = description;
+        peerConnection.connectionState = "connected";
+        internal.handlePeerConnectionStateChange(peerConnection as unknown as RTCPeerConnection);
+      }),
+      addIceCandidate: vi.fn(),
+    };
+    const socket = { readyState: 1, send: vi.fn() };
+    Object.assign(connection, {
+      peerConnection,
+      socket,
+      iceGeneration: "AbCdEfGhIjKlMn01",
+      initialIceAttempt: 2,
+      initialIceRetryActive: true,
+    });
+    internal = connection as unknown as typeof internal;
+
+    await internal.handleRemoteDescription(
+      { type: "offer", sdp: "v=0\r\na=ice-ufrag:remote-new\r\n" },
+      "ZyXwVuTsRqPoNm10",
+    );
+
+    expect(peerConnection.setLocalDescription).toHaveBeenCalledWith(answer);
+    expect(socket.send).toHaveBeenCalledTimes(1);
+    expect(sentSignal(socket.send)).toMatchObject({
+      type: "signal",
+      payload: { description: answer, iceGeneration: "ZyXwVuTsRqPoNm10" },
+    });
+  });
+
   it("creates an ICE-restart offer without replacing the peer connection", async () => {
     vi.stubGlobal("WebSocket", { OPEN: 1 });
     const connection = await createTestConnection("creator");

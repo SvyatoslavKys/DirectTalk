@@ -24,6 +24,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  vi.useRealTimers();
   vi.clearAllMocks();
   vi.unstubAllEnvs();
   vi.unstubAllGlobals();
@@ -104,6 +105,157 @@ describe("rtcConfiguration", () => {
     });
   });
 
+  it("recognizes combined private-provider metadata and keeps both TURN configurations", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          provider: "metered+cloudflare",
+          iceServers: [
+            {
+              urls: [FALLBACK_STUN_URL, "turn:metered.example:443?transport=tcp"],
+              username: "metered-user",
+              credential: "metered-credential",
+            },
+            {
+              urls: [FALLBACK_STUN_URL, "turns:cloudflare.example:443?transport=tcp"],
+              username: "cloudflare-user",
+              credential: "cloudflare-credential",
+            },
+          ],
+        }),
+      }),
+    );
+
+    const configuration = await rtcConfiguration();
+
+    expect(configuration.iceServers).toEqual([
+      {
+        urls: [FALLBACK_STUN_URL, "turn:metered.example:443?transport=tcp"],
+        username: "metered-user",
+        credential: "metered-credential",
+      },
+      {
+        urls: ["turns:cloudflare.example:443?transport=tcp"],
+        username: "cloudflare-user",
+        credential: "cloudflare-credential",
+      },
+    ]);
+    expect(logDiagnostic).toHaveBeenCalledWith("turn", "credentials-ready", {
+      provider: "metered+cloudflare",
+      serverCount: 2,
+      relayConfigured: true,
+    });
+    expect(JSON.stringify(vi.mocked(logDiagnostic).mock.calls)).not.toContain("metered-credential");
+    expect(JSON.stringify(vi.mocked(logDiagnostic).mock.calls)).not.toContain("cloudflare-credential");
+  });
+
+  it("rejects oversized ICE URL arrays and falls back to STUN", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          provider: "metered",
+          iceServers: [{
+            urls: Array.from({ length: 9 }, (_, index) => `turn:relay-${index}.example:3478`),
+            username: "user",
+            credential: "credential",
+          }],
+        }),
+      }),
+    );
+
+    await expect(rtcConfiguration()).resolves.toEqual({
+      bundlePolicy: "max-bundle",
+      iceServers: [{ urls: FALLBACK_STUN_URL }],
+    });
+    expect(logDiagnostic).toHaveBeenCalledWith(
+      "turn",
+      "credentials-failed",
+      { reason: "Error: Too many TURN URLs" },
+      "warn",
+    );
+  });
+
+  it("preserves a shared TURN URL when provider credentials differ", async () => {
+    const sharedUrl = "turn:shared.example:3478";
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          provider: "metered+cloudflare",
+          iceServers: [
+            { urls: sharedUrl, username: "metered-user", credential: "metered-password" },
+            { urls: sharedUrl, username: "cloudflare-user", credential: "cloudflare-password" },
+          ],
+        }),
+      }),
+    );
+
+    const configuration = await rtcConfiguration();
+
+    expect(configuration.iceServers).toEqual([
+      { urls: sharedUrl, username: "metered-user", credential: "metered-password" },
+      { urls: sharedUrl, username: "cloudflare-user", credential: "cloudflare-password" },
+      { urls: FALLBACK_STUN_URL },
+    ]);
+  });
+
+  it("does not exceed the total URL bound when adding fallback STUN", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          provider: "metered+cloudflare",
+          iceServers: Array.from({ length: 3 }, (_, serverIndex) => ({
+            urls: Array.from(
+              { length: 8 },
+              (_, urlIndex) => `turn:relay-${serverIndex}-${urlIndex}.example:3478`,
+            ),
+            username: "user",
+            credential: "credential",
+          })),
+        }),
+      }),
+    );
+
+    const configuration = await rtcConfiguration();
+    const configuredUrls = configuration.iceServers?.flatMap((server) => iceServerUrls(server));
+
+    expect(configuredUrls).toHaveLength(24);
+    expect(configuredUrls).not.toContain(FALLBACK_STUN_URL);
+  });
+
+  it("waits nine seconds before aborting the TURN credentials request", async () => {
+    vi.useFakeTimers();
+    vi.stubGlobal("window", { ...window, setTimeout, clearTimeout });
+    let requestSignal: AbortSignal | undefined;
+    vi.stubGlobal("fetch", vi.fn().mockImplementation((_url: string, init: RequestInit) => {
+      requestSignal = init.signal as AbortSignal;
+      return new Promise((_resolve, reject) => {
+        requestSignal?.addEventListener("abort", () => reject(new Error("request aborted")), { once: true });
+      });
+    }));
+
+    const configurationPromise = rtcConfiguration();
+    await vi.advanceTimersByTimeAsync(8_999);
+    expect(requestSignal?.aborted).toBe(false);
+    await vi.advanceTimersByTimeAsync(1);
+    expect(requestSignal?.aborted).toBe(true);
+    await expect(configurationPromise).resolves.toEqual({
+      bundlePolicy: "max-bundle",
+      iceServers: [{ urls: FALLBACK_STUN_URL }],
+    });
+  });
+
   it("uses only the fallback STUN server when fetching TURN credentials fails", async () => {
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("network unavailable")));
 
@@ -119,3 +271,7 @@ describe("rtcConfiguration", () => {
     );
   });
 });
+
+function iceServerUrls(server: RTCIceServer): string[] {
+  return typeof server.urls === "string" ? [server.urls] : server.urls;
+}

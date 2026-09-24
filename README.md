@@ -8,7 +8,7 @@ A minimal private chat between two browsers. The signaling server only relays SD
 
 - one-time invitations via a link or locally generated QR code;
 - explicit connection confirmation before revealing an IP address to the peer;
-- a direct WebRTC DataChannel with Metered Open Relay TURN fallback for restrictive NATs and mobile networks;
+- a direct WebRTC DataChannel with multi-provider TURN fallback for restrictive NATs and mobile networks;
 - additional end-to-end encryption on top of DTLS without trusting the signaling server;
 - a persistent local device key and signed ephemeral session keys;
 - a safety code and persistent verified-contact status;
@@ -26,7 +26,7 @@ DirectTalk deploys as one Vercel project:
 
 - Vite builds the React frontend and Vercel serves it over HTTPS;
 - `api/signal.mjs` exposes the same-origin WebSocket endpoint at `/api/signal`;
-- `api/turn.mjs` obtains Metered TURN credentials without exposing the long-lived Metered API key to the browser; until a private provider is configured, it generates short-lived credentials for Metered's officially published Open Relay static-auth test service;
+- `api/turn.mjs` obtains Metered and/or Cloudflare TURN credentials without exposing long-lived provider secrets to the browser; until a private provider is configured, it generates short-lived credentials for Metered's officially published Open Relay static-auth test service;
 - the signaling backend relays only SDP and ICE while the connection is being established;
 - once the encrypted DataChannel handshake succeeds, both browsers close their signaling WebSockets and continue peer to peer;
 - Redis Cloud coordinates signaling sockets that land on different Vercel Function instances and rate-limits TURN credential requests using a keyed hash of the client address. It never stores messages, photos, names, encryption keys, raw IP addresses, or TURN secrets.
@@ -38,12 +38,12 @@ Vercel WebSocket Functions have a maximum lifetime. Before WebRTC is ready, the 
 1. Push this directory to a GitHub repository.
 2. In Vercel, create a project and import that repository. Vercel reads `vercel.json`; no build-setting changes are required.
 3. In the Vercel Marketplace, add **Redis Cloud** to this project and make sure it creates a `REDIS_URL` environment variable for Production and Preview.
-4. For testing, no TURN provider variables are required: DirectTalk uses Metered's public Open Relay static-auth service. Before production, create a private Metered app/API key, add its endpoint without the `apiKey` query parameter as `METERED_TURN_CREDENTIALS_URL` (for example, `https://your-app.metered.live/api/v1/turn/credentials`), and add the key as the sensitive `METERED_TURN_API_KEY`. Enable both for Production and Preview. These are server-side variables: never add `VITE_` to their names.
-5. Optionally add Cloudflare Realtime TURN as a secondary provider through `CLOUDFLARE_TURN_KEY_ID` and `CLOUDFLARE_TURN_API_TOKEN`. When both providers exist, Metered is tried first.
+4. For testing, no TURN provider variables are required: DirectTalk uses Metered's public Open Relay static-auth service. Before production, configure at least one private provider. For Metered, add the credentials endpoint without the `apiKey` query parameter as `METERED_TURN_CREDENTIALS_URL` (for example, `https://your-app.metered.live/api/v1/turn/credentials`) and add the key as the sensitive `METERED_TURN_API_KEY`. These are server-side variables: never add `VITE_` to their names.
+5. Alternatively or additionally, add Cloudflare Realtime TURN through `CLOUDFLARE_TURN_KEY_ID` and `CLOUDFLARE_TURN_API_TOKEN`. When both private providers are configured, credentials are fetched independently and all working ICE server sets are returned so the browser can select a reachable relay. Enable the chosen variables for Production and Preview.
 6. Optionally add a random server-side `TURN_RATE_LIMIT_SECRET`. The endpoint otherwise uses the primary provider secret as its HMAC key when storing an irreversible per-client rate-limit identifier in Redis.
 7. Do not add `VITE_SIGNALING_URL` in Vercel. The browser automatically connects to `wss://<your-domain>/api/signal` on the same origin.
 8. Redeploy after adding the variables, then open `https://<your-domain>/api/signal`. A configured deployment returns JSON with `"status":"ok"`, `"sharedBroker":true`, and `"storesMessages":false`.
-9. Open the app on two different devices. Create an invitation on the first device and open it on the second. In Diagnostics, a working configuration shows `turn credentials-ready` with `"provider":"metered"` and `relayConfigured:true`. A restrictive-network connection should also produce at least one ICE entry with `"iceType":"relay"`.
+9. Open the app on two different devices. Create an invitation on the first device and open it on the second. In Diagnostics, a working private configuration names `metered`, `cloudflare`, or both and reports `relayConfigured:true`. A restrictive-network connection should also produce at least one ICE entry with `"iceType":"relay"`.
 
 Always test invitations on the stable production domain, not a temporary Vercel deployment URL. Set `VITE_PUBLIC_APP_URL` if the production domain is different from `https://direct-talk.vercel.app`.
 
@@ -51,7 +51,7 @@ Always test invitations on the stable production domain, not a temporary Vercel 
 
 The in-app **Diagnostics** button opens a mobile-friendly technical log. On a narrow screen it is shown as an `i` button in the top bar. The error screen also links directly to this panel.
 
-The report records connection stages, signaling and WebRTC state changes, DataChannel state, encrypted-handshake stages, ICE recovery attempts, and an anonymized summary of the selected route. Use **Share logs** on a phone or **Copy logs** on desktop. It intentionally excludes message text, files, cryptographic keys, invitation secrets, SDP, ICE candidate values, IP addresses, ports, and exact encrypted-message sizes. It records only route classes (`host`, `srflx`, `prflx`, or `relay`), transport type, bucketed buffer and traffic sizes, packet counters, and rounded timing. The log survives a normal reload in the same tab through `sessionStorage`, but a browser process crash may still remove it.
+The report records connection stages, signaling and WebRTC state changes, DataChannel state, encrypted-handshake stages, bounded initial retries, ICE recovery attempts, and an anonymized summary of the selected route. Use **Share logs** on a phone or **Copy logs** on desktop. It intentionally excludes message text, files, cryptographic keys, invitation secrets, SDP, ICE candidate values, IP addresses, ports, and exact encrypted-message sizes. It records only route classes (`host`, `srflx`, `prflx`, or `relay`), transport type, bucketed buffer and traffic sizes, packet counters, and rounded timing. The log survives a normal reload in the same tab through `sessionStorage`, but a browser process crash may still remove it.
 
 To test the deployed signaling endpoint from a terminal:
 
@@ -63,7 +63,7 @@ npm run test:signal
 
 WebSockets on Vercel are currently a Public Beta. DirectTalk requests short-lived TURN credentials before creating the peer connection. Without private provider variables, the endpoint uses Metered's public static-auth Open Relay service for testing. If the endpoint or relay is unavailable, the browser falls back to STUN-only mode, which can still fail between restrictive networks and is reported in Diagnostics.
 
-DirectTalk exchanges explicit end-of-candidates markers before releasing signaling. If an established route is briefly lost, both browsers preserve the encrypted DataChannel, reopen signaling when needed, and make up to two bounded ICE-restart attempts before reporting a fatal connection error.
+DirectTalk exchanges explicit end-of-candidates markers before releasing signaling. A failed initial route is retried with fresh TURN credentials and up to two bounded ICE restarts on the existing peer connection. If an established route is briefly lost, both browsers preserve the encrypted DataChannel, reopen signaling when needed, and make up to two bounded ICE-restart attempts before reporting a fatal connection error.
 
 ## Local development
 
@@ -101,12 +101,12 @@ See `.env.example` for an example configuration.
 - `REDIS_URL` — Redis connection URL used only to coordinate Vercel Function instances; required on Vercel and optional for the single-process local server.
 - `METERED_TURN_CREDENTIALS_URL` — server-side Metered credentials endpoint without an `apiKey` query parameter; only HTTPS `*.metered.live/api/v1/turn/credentials` URLs are accepted.
 - `METERED_TURN_API_KEY` — server-side Metered API key; mark it sensitive in Vercel.
-- `CLOUDFLARE_TURN_KEY_ID` — optional server-side Cloudflare Realtime TURN key ID for fallback.
-- `CLOUDFLARE_TURN_API_TOKEN` — optional Cloudflare key secret for fallback; mark it sensitive in Vercel.
+- `CLOUDFLARE_TURN_KEY_ID` — optional server-side Cloudflare Realtime TURN key ID; when Metered is also configured, both working server sets are returned.
+- `CLOUDFLARE_TURN_API_TOKEN` — optional Cloudflare key secret; mark it sensitive in Vercel.
 - `TURN_CREDENTIAL_TTL_SECONDS` — optional Cloudflare credential lifetime; defaults to 21,600 seconds and is clamped to 10 minutes–12 hours.
 - `TURN_RATE_LIMIT_SECRET` — optional independent HMAC secret for privacy-preserving per-client TURN request rate limiting.
 
-The built-in `open-relay-test` provider uses Metered's publicly documented shared static-auth service. It is intended only for testing and has no private capacity or availability guarantee. Configure the two `METERED_TURN_*` variables before treating the deployment as production-ready; DirectTalk then disables the public test provider automatically.
+The built-in `open-relay-test` provider uses Metered's publicly documented shared static-auth service. It is intended only for testing and has no private capacity or availability guarantee. Configure Metered or Cloudflare private TURN variables before treating the deployment as production-ready; DirectTalk then disables the public test provider automatically.
 
 Never place a long-lived TURN secret in a `VITE_*` variable: everything with that prefix is included in the client-side JavaScript. A production service should issue short-lived TURN credentials to the browser from a server-side endpoint.
 
@@ -136,7 +136,7 @@ SECURITY.md            threat model and security limitations
 - serve the client exclusively over HTTPS and signaling exclusively over WSS;
 - configure CSP and the other headers documented in `SECURITY.md` on the HTTP server instead of relying only on the meta tag;
 - allow only the production origin in `ALLOWED_ORIGINS`;
-- configure Metered Open Relay TURN and verify that Diagnostics names the Metered provider and reports relay candidates on a restrictive-network test;
+- configure at least one private TURN provider and verify that Diagnostics names it and reports relay candidates on a restrictive-network test;
 - do not add analytics, third-party scripts, or HTML rendering for message content;
 - obtain an independent review of the protocol and implementation before making production-security claims;
 - add protocol versioning and migrations before onboarding real users.

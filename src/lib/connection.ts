@@ -25,6 +25,9 @@ import { logDiagnostic, safeErrorText } from "./diagnostics";
 
 const SIGNALING_CLOSE_GRACE_MS = 2_000;
 const DISCONNECTED_GRACE_MS = 1_500;
+const INITIAL_ICE_FAILURE_GRACE_MS = 1_500;
+const INITIAL_ICE_ATTEMPT_TIMEOUT_MS = 18_000;
+const MAX_INITIAL_ICE_ATTEMPTS = 3;
 const RECOVERY_TIMEOUT_MS = 15_000;
 const RECOVERY_RETRY_DELAY_MS = 1_000;
 const MAX_RECOVERY_ATTEMPTS = 2;
@@ -107,6 +110,8 @@ export class DirectTalkConnection {
   private reconnectTimer?: number;
   private signalingCloseTimer?: number;
   private disconnectedTimer?: number;
+  private initialIceFailureTimer?: number;
+  private initialIceAttemptTimer?: number;
   private recoveryTimer?: number;
   private reconnectAttempts = 0;
   private recoveryAttempts = 0;
@@ -117,6 +122,11 @@ export class DirectTalkConnection {
   private recoveryStartedAt = 0;
   private recoveryGeneration = 0;
   private recoverySawChecking = false;
+  private initialIceAttempt = 1;
+  private initialIceRetryActive = false;
+  private initialIceRefreshPending = false;
+  private initialIceRetryGeneration = 0;
+  private initialIcePreparation?: Promise<boolean>;
   private signalingPeerReady = false;
   private signalingGeneration = 0;
   private peerGeneration = 0;
@@ -155,16 +165,21 @@ export class DirectTalkConnection {
   }
 
   private async startConnection(): Promise<void> {
-    this.rtcConfig = await rtcConfiguration();
+    const configuration = await rtcConfiguration();
     if (this.closed) return;
+    this.applyRtcConfiguration(configuration);
+    if (!this.peerConnection) this.setupPeerConnection();
+    this.openSignalingSocket();
+  }
+
+  private applyRtcConfiguration(configuration: RTCConfiguration): void {
+    this.rtcConfig = configuration;
     const serverCount = this.rtcConfig.iceServers?.length ?? 0;
     this.relayConfigured = this.rtcConfig.iceServers?.some((server) => {
       const urls = typeof server.urls === "string" ? [server.urls] : server.urls;
       return urls.some((url) => /^(?:turn|turns):/iu.test(url));
     }) ?? false;
     this.trace("rtc-configuration-ready", { serverCount, relayConfigured: this.relayConfigured });
-    if (!this.peerConnection) this.setupPeerConnection();
-    this.openSignalingSocket();
   }
 
   private openSignalingSocket(): void {
@@ -257,12 +272,19 @@ export class DirectTalkConnection {
     if (this.reconnectTimer !== undefined) window.clearTimeout(this.reconnectTimer);
     if (this.signalingCloseTimer !== undefined) window.clearTimeout(this.signalingCloseTimer);
     if (this.disconnectedTimer !== undefined) window.clearTimeout(this.disconnectedTimer);
+    if (this.initialIceFailureTimer !== undefined) window.clearTimeout(this.initialIceFailureTimer);
+    if (this.initialIceAttemptTimer !== undefined) window.clearTimeout(this.initialIceAttemptTimer);
     if (this.recoveryTimer !== undefined) window.clearTimeout(this.recoveryTimer);
     this.reconnectTimer = undefined;
     this.signalingCloseTimer = undefined;
     this.disconnectedTimer = undefined;
+    this.initialIceFailureTimer = undefined;
+    this.initialIceAttemptTimer = undefined;
     this.recoveryTimer = undefined;
     this.peerGeneration += 1;
+    this.initialIceRetryGeneration += 1;
+    this.initialIceRefreshPending = false;
+    this.initialIcePreparation = undefined;
     this.recoveryGeneration += 1;
     this.dataChannel?.close();
     this.peerConnection?.close();
@@ -372,13 +394,15 @@ export class DirectTalkConnection {
       if (generation !== this.peerGeneration || this.closed) return;
       this.trace("data-channel-closed", { state: channel.readyState }, "warn");
       void this.captureTransportSnapshot("data-channel-closed");
-      this.fail(new Error("Прямое соединение закрыто"), "data-channel-close");
+      if (this.secureNotified) this.fail(new Error("Прямое соединение закрыто"), "data-channel-close");
+      else this.failUnavailableInitialIceRetry("data-channel-close", new Error("Прямое соединение закрыто"));
     });
     channel.addEventListener("error", () => {
       if (generation !== this.peerGeneration) return;
       this.trace("data-channel-error", { state: channel.readyState }, "error");
       void this.captureTransportSnapshot("data-channel-error");
-      this.fail(new Error("Ошибка WebRTC DataChannel"), "data-channel-error");
+      if (this.secureNotified) this.fail(new Error("Ошибка WebRTC DataChannel"), "data-channel-error");
+      else this.failUnavailableInitialIceRetry("data-channel-error", new Error("Ошибка WebRTC DataChannel"));
     });
   }
 
@@ -440,11 +464,15 @@ export class DirectTalkConnection {
     this.offerStarted = true;
     this.trace("offer-creating");
     const peerConnection = this.requirePeerConnection();
+    const peerGeneration = this.peerGeneration;
+    const initialIceRetryGeneration = this.initialIceRetryGeneration;
     const offer = await peerConnection.createOffer();
+    if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return;
     this.iceGeneration = createIceGeneration();
     this.legacyIceGeneration = false;
     this.prepareLocalIceDescription(offer);
     await peerConnection.setLocalDescription(offer);
+    if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return;
     this.syncLocalIceUsernameFragments(peerConnection.localDescription);
     this.trace("offer-local-set");
     this.signalLocalDescription(offer);
@@ -499,6 +527,40 @@ export class DirectTalkConnection {
     if (description.type !== "offer" && description.type !== "answer") throw new Error("Некорректный тип SDP");
     if (this.options.role === "creator" && description.type !== "answer") throw new Error("Ожидался SDP answer");
     if (this.options.role === "joiner" && description.type !== "offer") throw new Error("Ожидался SDP offer");
+    if (description.type === "offer" && !this.secureNotified) {
+      const peerConnection = this.requirePeerConnection();
+      const passiveRetry = Boolean(
+        iceGeneration &&
+        this.iceGeneration &&
+        iceGeneration !== this.iceGeneration &&
+        (
+          peerConnection.connectionState === "failed" ||
+          peerConnection.connectionState === "disconnected" ||
+          this.initialIceFailureTimer !== undefined ||
+          this.initialIceRetryActive ||
+          this.initialIcePreparation
+        )
+      );
+      if (passiveRetry) {
+        const failureWasRecorded = this.initialIceFailureTimer !== undefined || this.initialIceRetryActive;
+        this.cancelInitialIceFailureTimer();
+        this.cancelInitialIceAttemptTimer();
+        if (!failureWasRecorded && !this.initialIcePreparation) {
+          this.traceInitialIceCandidateSummary("remote-offer");
+          this.trace("initial-ice-retry-failed", { attempt: this.initialIceAttempt, trigger: "remote-offer" }, "warn");
+        }
+        if (!this.initialIceRetryActive && !this.initialIcePreparation) {
+          const prepared = await this.startInitialIceRetry("remote-offer", peerConnection);
+          if (!prepared || this.closed) return;
+        } else if (this.initialIcePreparation) {
+          const prepared = await this.initialIcePreparation;
+          if (!prepared || this.closed) return;
+        }
+      } else if (this.initialIcePreparation) {
+        const prepared = await this.initialIcePreparation;
+        if (!prepared || this.closed) return;
+      }
+    }
     if (description.type === "answer") {
       if (iceGeneration && this.iceGeneration && iceGeneration !== this.iceGeneration) {
         this.trace("stale-ice-description-ignored", { type: description.type }, "warn");
@@ -528,6 +590,8 @@ export class DirectTalkConnection {
     }
 
     const peerConnection = this.requirePeerConnection();
+    const peerGeneration = this.peerGeneration;
+    const initialIceRetryGeneration = this.initialIceRetryGeneration;
     const recoveryOperation = this.recovering;
     const recoveryGeneration = this.recoveryGeneration;
     if (this.recovering && description.type === "offer") {
@@ -535,11 +599,13 @@ export class DirectTalkConnection {
       this.recoveryNegotiated = false;
     }
     await peerConnection.setRemoteDescription(description);
+    if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return;
     if (recoveryOperation && !this.isCurrentRecovery(recoveryGeneration, peerConnection)) return;
     if (this.recovering) this.awaitingRecoveryRemoteDescription = false;
     this.trace("remote-description-set", { type: description.type, queuedCandidates: this.pendingCandidates.length });
     for (const candidate of this.pendingCandidates.splice(0)) {
       await addIceCandidate(peerConnection, candidate);
+      if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return;
       if (recoveryOperation && !this.isCurrentRecovery(recoveryGeneration, peerConnection)) return;
     }
 
@@ -550,9 +616,11 @@ export class DirectTalkConnection {
         this.candidateSummaryLogged = false;
       }
       const answer = await peerConnection.createAnswer();
+      if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return;
       if (recoveryOperation && !this.isCurrentRecovery(recoveryGeneration, peerConnection)) return;
       this.prepareLocalIceDescription(answer);
       await peerConnection.setLocalDescription(answer);
+      if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return;
       if (recoveryOperation && !this.isCurrentRecovery(recoveryGeneration, peerConnection)) return;
       this.syncLocalIceUsernameFragments(peerConnection.localDescription);
       this.trace("answer-local-set");
@@ -711,6 +779,12 @@ export class DirectTalkConnection {
   private notifySecureIfReady(): void {
     if (!this.session || !this.remoteHello || !this.sentSessionReady || !this.receivedSessionReady || this.secureNotified) return;
     this.secureNotified = true;
+    this.cancelInitialIceFailureTimer();
+    this.cancelInitialIceAttemptTimer();
+    this.initialIceRetryActive = false;
+    this.initialIceRefreshPending = false;
+    this.initialIceRetryGeneration += 1;
+    this.initialIcePreparation = undefined;
     this.trace("secure-session-established");
     this.options.onState("secure");
     this.options.onSecure({
@@ -733,6 +807,18 @@ export class DirectTalkConnection {
     if (connectionState === "connected") {
       if (this.disconnectedTimer !== undefined) window.clearTimeout(this.disconnectedTimer);
       this.disconnectedTimer = undefined;
+      this.cancelInitialIceFailureTimer();
+      this.cancelInitialIceAttemptTimer();
+      if (!this.secureNotified && (this.initialIceRetryActive || this.initialIcePreparation)) {
+        const completedAttempt = this.initialIceAttempt;
+        if (this.initialIceRefreshPending) {
+          this.initialIceRetryGeneration += 1;
+          this.initialIcePreparation = undefined;
+        }
+        this.initialIceRefreshPending = false;
+        this.initialIceRetryActive = false;
+        this.trace("initial-ice-retry-succeeded", { attempt: completedAttempt });
+      }
       if (this.recovering) {
         if (!this.recoveryOfferStarted) this.finishIceRecovery();
         else {
@@ -750,7 +836,11 @@ export class DirectTalkConnection {
 
     if (connectionState === "disconnected") {
       this.cancelSignalingClose();
-      if (!this.secureNotified || this.disconnectedTimer !== undefined || this.recovering) return;
+      if (!this.secureNotified) {
+        this.scheduleInitialIceRetry("disconnected", peerConnection);
+        return;
+      }
+      if (this.disconnectedTimer !== undefined || this.recovering) return;
       this.trace("ice-recovery-grace-started", { delay: DISCONNECTED_GRACE_MS }, "warn");
       this.disconnectedTimer = window.setTimeout(() => {
         this.disconnectedTimer = undefined;
@@ -764,11 +854,197 @@ export class DirectTalkConnection {
       if (this.disconnectedTimer !== undefined) window.clearTimeout(this.disconnectedTimer);
       this.disconnectedTimer = undefined;
       if (this.secureNotified) this.startIceRecovery("failed");
-      else this.fail(new Error("Не удалось установить WebRTC-соединение"), "peer-connection");
+      else this.scheduleInitialIceRetry("failed", peerConnection);
       return;
     }
 
     if (connectionState === "closed" && !this.closed) this.close();
+  }
+
+  private scheduleInitialIceRetry(
+    trigger: string,
+    peerConnection: RTCPeerConnection,
+    reason?: unknown,
+    force = false,
+  ): void {
+    if (
+      this.closed ||
+      this.secureNotified ||
+      this.recovering ||
+      this.initialIceFailureTimer !== undefined ||
+      this.initialIcePreparation
+    ) {
+      return;
+    }
+    this.cancelInitialIceAttemptTimer();
+    this.initialIceRetryActive = false;
+    this.traceInitialIceCandidateSummary(trigger);
+    this.trace("initial-ice-retry-failed", {
+      attempt: this.initialIceAttempt,
+      trigger,
+      ...(reason === undefined ? {} : { reason: safeErrorText(reason) }),
+    }, "warn");
+    this.initialIceFailureTimer = window.setTimeout(() => {
+      this.initialIceFailureTimer = undefined;
+      if (
+        this.closed ||
+        this.secureNotified ||
+        peerConnection !== this.peerConnection ||
+        (!force && peerConnection.connectionState !== "failed" && peerConnection.connectionState !== "disconnected") ||
+        peerConnection.connectionState === "connected"
+      ) {
+        return;
+      }
+      if (this.initialIceAttempt >= MAX_INITIAL_ICE_ATTEMPTS) {
+        this.exhaustInitialIceRetries(trigger);
+        return;
+      }
+      const channelState = this.dataChannel?.readyState;
+      if (channelState === "closed" || channelState === "closing") {
+        this.failUnavailableInitialIceRetry("data-channel-close", new Error("Прямое соединение закрыто"));
+        return;
+      }
+      void this.startInitialIceRetry(trigger, peerConnection);
+    }, INITIAL_ICE_FAILURE_GRACE_MS);
+  }
+
+  private startInitialIceRetry(trigger: string, peerConnection: RTCPeerConnection): Promise<boolean> {
+    if (this.initialIcePreparation) return this.initialIcePreparation;
+    if (this.closed || this.secureNotified || peerConnection !== this.peerConnection) return Promise.resolve(false);
+    if (this.initialIceAttempt >= MAX_INITIAL_ICE_ATTEMPTS) {
+      this.exhaustInitialIceRetries(trigger);
+      return Promise.resolve(false);
+    }
+    this.initialIceAttempt += 1;
+    this.initialIceRetryActive = true;
+    const initialIceRetryGeneration = ++this.initialIceRetryGeneration;
+    const peerGeneration = this.peerGeneration;
+    this.trace("initial-ice-retry-started", { attempt: this.initialIceAttempt, trigger }, "warn");
+    const rawOperation = this.performInitialIceRetry(
+      trigger,
+      peerConnection,
+      peerGeneration,
+      initialIceRetryGeneration,
+    );
+    const operation = rawOperation
+      .then((started) => {
+        if (started && this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) {
+          this.armInitialIceAttemptTimer(peerConnection, initialIceRetryGeneration);
+        }
+        return started;
+      })
+      .catch((error: unknown) => {
+        if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return false;
+        this.initialIcePreparation = undefined;
+        this.initialIceRefreshPending = false;
+        this.initialIceRetryActive = false;
+        this.scheduleInitialIceRetry("retry-setup", peerConnection, error, true);
+        return false;
+      });
+    this.initialIcePreparation = operation;
+    void operation.finally(() => {
+      if (this.initialIcePreparation === operation) this.initialIcePreparation = undefined;
+    });
+    return operation;
+  }
+
+  private async performInitialIceRetry(
+    _trigger: string,
+    peerConnection: RTCPeerConnection,
+    peerGeneration: number,
+    initialIceRetryGeneration: number,
+  ): Promise<boolean> {
+    this.initialIceRefreshPending = true;
+    const configuration = await rtcConfiguration();
+    if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return false;
+    this.initialIceRefreshPending = false;
+    this.applyRtcConfiguration(configuration);
+    peerConnection.setConfiguration(configuration);
+    if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return false;
+
+    this.pendingCandidates = [];
+    this.remoteCandidateCount = 0;
+    this.localIceComplete = false;
+    this.remoteIceComplete = false;
+    this.candidateSummaryLogged = false;
+    this.legacyIceGeneration = false;
+
+    if (this.options.role === "joiner") {
+      peerConnection.restartIce();
+      this.trace("initial-ice-retry-awaiting-offer", { attempt: this.initialIceAttempt });
+      return true;
+    }
+
+    this.trace("initial-ice-retry-offer-creating", { attempt: this.initialIceAttempt });
+    const offer = await peerConnection.createOffer({ iceRestart: true });
+    if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return false;
+    this.iceGeneration = createIceGeneration();
+    this.prepareLocalIceDescription(offer);
+    await peerConnection.setLocalDescription(offer);
+    if (!this.isCurrentPeerOperation(peerGeneration, initialIceRetryGeneration, peerConnection)) return false;
+    this.syncLocalIceUsernameFragments(peerConnection.localDescription);
+    this.trace("initial-ice-retry-offer-local-set", { attempt: this.initialIceAttempt });
+    this.signalLocalDescription(offer);
+    return true;
+  }
+
+  private exhaustInitialIceRetries(trigger: string): void {
+    this.traceInitialIceCandidateSummary(trigger);
+    this.trace("initial-ice-retry-exhausted", { attempt: this.initialIceAttempt, trigger }, "error");
+    this.fail(new Error("Не удалось установить WebRTC-соединение"), "peer-connection");
+  }
+
+  private failUnavailableInitialIceRetry(trigger: string, error: Error): void {
+    if (this.closed) return;
+    this.cancelInitialIceFailureTimer();
+    this.cancelInitialIceAttemptTimer();
+    this.initialIceRetryGeneration += 1;
+    this.initialIcePreparation = undefined;
+    this.initialIceRefreshPending = false;
+    this.initialIceRetryActive = false;
+    this.traceInitialIceCandidateSummary(trigger);
+    this.trace("initial-ice-retry-failed", { attempt: this.initialIceAttempt, trigger }, "warn");
+    this.trace("initial-ice-retry-exhausted", { attempt: this.initialIceAttempt, trigger }, "error");
+    this.fail(error, trigger);
+  }
+
+  private cancelInitialIceFailureTimer(): void {
+    if (this.initialIceFailureTimer !== undefined) window.clearTimeout(this.initialIceFailureTimer);
+    this.initialIceFailureTimer = undefined;
+  }
+
+  private armInitialIceAttemptTimer(peerConnection: RTCPeerConnection, initialIceRetryGeneration: number): void {
+    this.cancelInitialIceAttemptTimer();
+    this.initialIceAttemptTimer = window.setTimeout(() => {
+      this.initialIceAttemptTimer = undefined;
+      if (
+        this.closed ||
+        this.secureNotified ||
+        peerConnection !== this.peerConnection ||
+        initialIceRetryGeneration !== this.initialIceRetryGeneration ||
+        peerConnection.connectionState === "connected"
+      ) {
+        return;
+      }
+      this.initialIceRetryActive = false;
+      this.scheduleInitialIceRetry("timeout", peerConnection, undefined, true);
+    }, INITIAL_ICE_ATTEMPT_TIMEOUT_MS);
+  }
+
+  private cancelInitialIceAttemptTimer(): void {
+    if (this.initialIceAttemptTimer !== undefined) window.clearTimeout(this.initialIceAttemptTimer);
+    this.initialIceAttemptTimer = undefined;
+  }
+
+  private isCurrentPeerOperation(
+    peerGeneration: number,
+    initialIceRetryGeneration: number,
+    peerConnection: RTCPeerConnection,
+  ): boolean {
+    return !this.closed &&
+      peerGeneration === this.peerGeneration &&
+      initialIceRetryGeneration === this.initialIceRetryGeneration &&
+      peerConnection === this.peerConnection;
   }
 
   private startIceRecovery(trigger: string): void {
@@ -1046,7 +1322,30 @@ export class DirectTalkConnection {
   private traceCandidateSummary(): void {
     if (this.candidateSummaryLogged) return;
     this.candidateSummaryLogged = true;
-    const details = {
+    const details = this.candidateSummaryDetails();
+    this.trace("ice-gathering-complete", details);
+    if (this.relayConfigured && this.localCandidateTypes.relay === 0) {
+      this.trace("relay-route-unavailable", details, "warn");
+    }
+  }
+
+  private traceInitialIceCandidateSummary(trigger: string): void {
+    this.trace("initial-ice-candidate-summary", {
+      attempt: this.initialIceAttempt,
+      trigger,
+      ...this.candidateSummaryDetails(),
+    }, "warn");
+  }
+
+  private candidateSummaryDetails(): {
+    count: number;
+    hostCandidates: number;
+    srflxCandidates: number;
+    prflxCandidates: number;
+    relayCandidates: number;
+    relayConfigured: boolean;
+  } {
+    return {
       count: this.localCandidateCount,
       hostCandidates: this.localCandidateTypes.host,
       srflxCandidates: this.localCandidateTypes.srflx,
@@ -1054,10 +1353,6 @@ export class DirectTalkConnection {
       relayCandidates: this.localCandidateTypes.relay,
       relayConfigured: this.relayConfigured,
     };
-    this.trace("ice-gathering-complete", details);
-    if (this.relayConfigured && this.localCandidateTypes.relay === 0) {
-      this.trace("relay-route-unavailable", details, "warn");
-    }
   }
 
   private async captureTransportSnapshot(trigger: string): Promise<void> {
@@ -1095,7 +1390,14 @@ export class DirectTalkConnection {
 
   private resetPeerConnection(): void {
     this.trace("peer-reset", { generation: this.peerGeneration + 1 }, "warn");
+    this.cancelInitialIceFailureTimer();
+    this.cancelInitialIceAttemptTimer();
     this.peerGeneration += 1;
+    this.initialIceRetryGeneration += 1;
+    this.initialIcePreparation = undefined;
+    this.initialIceRefreshPending = false;
+    this.initialIceRetryActive = false;
+    this.initialIceAttempt = 1;
     this.dataChannel?.close();
     this.peerConnection?.close();
     this.dataChannel = undefined;
