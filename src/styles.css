@@ -2100,7 +2100,7 @@ textarea:focus {
   }
 }
 
-@media (max-width: 760px) {
+@media (max-width: 760px), (max-height: 500px) and (hover: none) and (pointer: coarse) {
   html,
   body,
   #root {
@@ -2120,8 +2120,12 @@ textarea:focus {
   }
 
   .topbar {
-    min-height: 54px;
-    padding: 7px 10px;
+    min-height: calc(54px + env(safe-area-inset-top, 0px));
+    padding:
+      calc(7px + env(safe-area-inset-top, 0px))
+      calc(10px + env(safe-area-inset-right, 0px))
+      7px
+      calc(10px + env(safe-area-inset-left, 0px));
     background: color-mix(in srgb, var(--desktop) 88%, transparent);
     border-bottom: 1px solid var(--line-soft);
   }
@@ -2142,8 +2146,19 @@ textarea:focus {
     border-radius: 0;
   }
 
+  .diagnostics-panel > .window-titlebar {
+    min-height: calc(48px + env(safe-area-inset-top, 0px));
+    padding-top: calc(7px + env(safe-area-inset-top, 0px));
+    padding-right: calc(9px + env(safe-area-inset-right, 0px));
+    padding-left: calc(13px + env(safe-area-inset-left, 0px));
+  }
+
   .diagnostics-body {
-    padding: 13px;
+    padding:
+      13px
+      calc(13px + env(safe-area-inset-right, 0px))
+      calc(13px + env(safe-area-inset-bottom, 0px))
+      calc(13px + env(safe-area-inset-left, 0px));
   }
 
   .diagnostics-body textarea {
@@ -2235,6 +2250,35 @@ textarea:focus {
     margin: 0;
   }
 
+  .chat-card > .window-titlebar {
+    min-height: calc(48px + env(safe-area-inset-top, 0px));
+    gap: 6px;
+    padding:
+      calc(7px + env(safe-area-inset-top, 0px))
+      calc(9px + env(safe-area-inset-right, 0px))
+      7px
+      calc(13px + env(safe-area-inset-left, 0px));
+  }
+
+  .chat-card > .window-titlebar > strong {
+    flex: 1 1 0;
+  }
+
+  .chat-card > .window-titlebar > .chat-language-picker,
+  .chat-card > .window-titlebar > .window-controls {
+    flex: 0 0 auto;
+  }
+
+  .chat-card > .window-titlebar .window-controls span {
+    display: none;
+  }
+
+  .chat-card > .window-titlebar .window-controls button {
+    width: 44px;
+    height: 44px;
+    font-size: 17px;
+  }
+
   .chat-open {
     grid-template-rows: minmax(0, 1fr);
   }
@@ -2245,15 +2289,27 @@ textarea:focus {
   }
 
   .chat-toolbar {
-    min-height: 51px;
+    min-height: 56px;
+    gap: 4px;
+    padding:
+      6px
+      calc(6px + env(safe-area-inset-right, 0px))
+      6px
+      calc(6px + env(safe-area-inset-left, 0px));
   }
 
   .chat-toolbar button {
-    min-width: 48px;
+    min-width: 44px;
+    min-height: 44px;
+    flex: 1 1 0;
     grid-template-columns: 1fr;
     justify-items: center;
     padding: 4px;
     font-size: 0;
+  }
+
+  .chat-toolbar .security-tool {
+    margin-left: 0;
   }
 
   .chat-toolbar button > span {
@@ -2277,8 +2333,20 @@ textarea:focus {
     display: none;
   }
 
+  .message-list {
+    padding-right: calc(16px + env(safe-area-inset-right, 0px));
+    padding-left: calc(16px + env(safe-area-inset-left, 0px));
+  }
+
+  .composer {
+    padding-right: calc(9px + env(safe-area-inset-right, 0px));
+    padding-left: calc(9px + env(safe-area-inset-left, 0px));
+  }
+
   .security-panel {
     grid-template-columns: 1fr auto;
+    padding-right: calc(13px + env(safe-area-inset-right, 0px));
+    padding-left: calc(13px + env(safe-area-inset-left, 0px));
   }
 
   .security-panel p {
@@ -2329,6 +2397,28 @@ textarea:focus {
   .window-statusbar span:nth-child(2) {
     display: none;
   }
+
+  .chat-card > .window-statusbar {
+    min-height: calc(27px + env(safe-area-inset-bottom, 0px));
+    gap: 8px;
+    padding:
+      4px
+      calc(9px + env(safe-area-inset-right, 0px))
+      calc(4px + env(safe-area-inset-bottom, 0px))
+      calc(9px + env(safe-area-inset-left, 0px));
+  }
+
+  .chat-card > .window-statusbar span:first-child {
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .chat-card > .window-statusbar span:last-child {
+    flex: 0 0 auto;
+    white-space: nowrap;
+  }
 }
 
 @media (max-width: 560px) {
@@ -2367,6 +2457,10 @@ textarea:focus {
   .language-picker select {
     width: 76px;
     padding-left: 1px;
+  }
+
+  .chat-language-picker {
+    display: none;
   }
 
   .theme-trigger {
@@ -2408,11 +2502,15 @@ textarea:focus {
   }
 
   .chat-toolbar button {
-    min-width: 42px;
+    min-width: 44px;
   }
 
   .message-list {
-    padding: 10px;
+    padding:
+      10px
+      calc(10px + env(safe-area-inset-right, 0px))
+      10px
+      calc(10px + env(safe-area-inset-left, 0px));
   }
 
   .message-actions-menu {
@@ -2437,7 +2535,11 @@ textarea:focus {
   }
 
   .composer {
-    padding: 7px;
+    padding:
+      7px
+      calc(7px + env(safe-area-inset-right, 0px))
+      7px
+      calc(7px + env(safe-area-inset-left, 0px));
   }
 
   .composer textarea {
