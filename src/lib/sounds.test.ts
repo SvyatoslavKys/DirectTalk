@@ -44,6 +44,13 @@ describe("sound preferences", () => {
 describe("procedural sound cues", () => {
   const cues: SoundCue[] = ["startup", "connect", "disconnect"];
 
+  it("opens with a gentle three-note A-E-A motif", () => {
+    const startup = soundPattern("startup");
+    expect(startup).toHaveLength(3);
+    expect(startup.map((tone) => tone.frequency)).toEqual([440, 659.25, 880]);
+    expect(startup.every((tone) => tone.endFrequency > tone.frequency)).toBe(true);
+  });
+
   it("uses short, quiet and distinct tone sequences", () => {
     const signatures = cues.map((cue) => {
       const pattern = soundPattern(cue);

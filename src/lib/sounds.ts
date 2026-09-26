@@ -18,9 +18,9 @@ export const SOUND_PREFERENCE_KEY = "directtalk.sounds";
 
 const SOUND_PATTERNS: Record<SoundCue, readonly Tone[]> = {
   startup: [
-    { at: 0, duration: 0.22, frequency: 392, endFrequency: 523.25, gain: 0.018, type: "triangle" },
-    { at: 0.12, duration: 0.24, frequency: 523.25, endFrequency: 659.25, gain: 0.021, type: "sine" },
-    { at: 0.27, duration: 0.31, frequency: 659.25, endFrequency: 987.77, gain: 0.017, type: "sine" },
+    { at: 0, duration: 0.26, frequency: 440, endFrequency: 493.88, gain: 0.015, type: "sine" },
+    { at: 0.16, duration: 0.27, frequency: 659.25, endFrequency: 739.99, gain: 0.017, type: "triangle" },
+    { at: 0.34, duration: 0.3, frequency: 880, endFrequency: 987.77, gain: 0.013, type: "sine" },
   ],
   connect: [
     { at: 0, duration: 0.18, frequency: 587.33, endFrequency: 739.99, gain: 0.024, type: "sine" },

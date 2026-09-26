@@ -65,6 +65,10 @@ type ThemeId = "lime" | "aqua" | "midnight";
 type PhotoTransferStatus = "preparing" | "waiting" | "transferring" | "receiving" | "complete" | "declined" | "cancelled" | "failed";
 type DeleteScope = "local" | "everyone";
 
+const SPLASH_OPEN_DELAY_MS = 650;
+const SPLASH_DURATION_MS = 2_400;
+const SPLASH_REDUCED_DURATION_MS = 650;
+
 interface DeleteConfirmation {
   messageId: string;
   scope: DeleteScope;
@@ -220,7 +224,10 @@ export default function App() {
 
   useEffect(() => {
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    const timer = window.setTimeout(() => setShowSplash(false), reduceMotion ? 650 : 2_400);
+    const timer = window.setTimeout(
+      () => setShowSplash(false),
+      reduceMotion ? SPLASH_REDUCED_DURATION_MS : SPLASH_DURATION_MS,
+    );
     return () => window.clearTimeout(timer);
   }, []);
 
@@ -231,10 +238,13 @@ export default function App() {
 
   useEffect(() => {
     if (!soundsEnabled) return;
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     let listening = true;
+    let startupTimer: number | null = null;
     const removeUnlockListeners = () => {
       if (!listening) return;
       listening = false;
+      if (startupTimer !== null) window.clearTimeout(startupTimer);
       window.removeEventListener("pointerdown", unlockSound, true);
       window.removeEventListener("keydown", unlockSound, true);
     };
@@ -249,7 +259,7 @@ export default function App() {
 
     window.addEventListener("pointerdown", unlockSound, { capture: true });
     window.addEventListener("keydown", unlockSound, { capture: true });
-    tryStartupSound();
+    startupTimer = window.setTimeout(tryStartupSound, reduceMotion ? 0 : SPLASH_OPEN_DELAY_MS);
     return removeUnlockListeners;
   }, [soundsEnabled]);
 
@@ -1672,10 +1682,23 @@ export default function App() {
 }
 
 function SplashScreen() {
+  const [markState, setMarkState] = useState<OxalisState>("offline");
+
+  useEffect(() => {
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    if (reduceMotion) {
+      setMarkState("online");
+      return;
+    }
+
+    const timer = window.setTimeout(() => setMarkState("online"), SPLASH_OPEN_DELAY_MS);
+    return () => window.clearTimeout(timer);
+  }, []);
+
   return (
     <div className="splash-screen" aria-hidden="true">
       <div className="splash-glow" />
-      <OxalisMark className="splash-logo" state="connecting" />
+      <OxalisMark className="splash-logo" state={markState} />
       <span className="splash-name">DirectTalk</span>
     </div>
   );
