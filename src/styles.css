@@ -46,6 +46,17 @@
   --oxalis-status-offline: #897985;
   --oxalis-status-connecting: #f0ad35;
   --oxalis-status-online: #65b938;
+  --visual-viewport-top: 0px;
+  --mobile-status-bar-fallback: 0px;
+  --safe-top: max(
+    env(safe-area-inset-top, 0px),
+    env(safe-area-max-inset-top, 0px),
+    var(--visual-viewport-top),
+    var(--mobile-status-bar-fallback)
+  );
+  --safe-right: max(env(safe-area-inset-right, 0px), env(safe-area-max-inset-right, 0px));
+  --safe-bottom: max(env(safe-area-inset-bottom, 0px), env(safe-area-max-inset-bottom, 0px));
+  --safe-left: max(env(safe-area-inset-left, 0px), env(safe-area-max-inset-left, 0px));
 }
 
 :root[data-theme="aqua"] {
@@ -189,10 +200,10 @@ button {
     radial-gradient(circle at 50% 46%, rgba(255, 255, 255, 0.98) 0 11%, rgba(211, 251, 255, 0.92) 34%, transparent 62%),
     linear-gradient(145deg, #efffff 0%, #d8f8f5 48%, #e9ffe4 100%);
   padding:
-    max(24px, env(safe-area-inset-top, 0px))
-    max(20px, env(safe-area-inset-right, 0px))
-    max(24px, env(safe-area-inset-bottom, 0px))
-    max(20px, env(safe-area-inset-left, 0px));
+    max(24px, var(--safe-top))
+    max(20px, var(--safe-right))
+    max(24px, var(--safe-bottom))
+    max(20px, var(--safe-left));
   isolation: isolate;
 }
 
@@ -253,7 +264,6 @@ button {
   display: block;
   user-select: none;
   filter: drop-shadow(0 18px 25px rgba(0, 104, 129, 0.22));
-  animation: splash-logo-await 520ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
 .splash-screen.started .splash-logo {
@@ -273,95 +283,20 @@ button {
   font-weight: 800;
   letter-spacing: -0.04em;
   text-shadow: 0 1px 0 white;
-  animation: splash-name-await 520ms ease both;
 }
 
 .splash-screen.started .splash-name {
   animation: splash-name-finish 1.9s ease both;
 }
 
-.splash-actions {
-  position: relative;
-  width: min(100%, 360px);
-  margin-top: 22px;
-  display: grid;
-  gap: 10px;
-  text-align: center;
-  animation: splash-actions-in 420ms 120ms ease both;
-}
-
-.splash-actions p {
-  margin: 0 0 2px;
-  color: #38717b;
-  font-size: 12px;
-  line-height: 1.45;
-}
-
-.splash-actions button {
-  min-height: 48px;
-  padding: 10px 18px;
-  border-radius: 9px;
-  font: inherit;
-  font-weight: 800;
-  cursor: pointer;
-}
-
-.splash-start-button {
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  gap: 9px;
-  color: #073e49;
-  background: linear-gradient(#f5fff4, #9eea8e);
-  border: 1px solid #3d9a79;
-  box-shadow: inset 1px 1px 0 #fff, 0 5px 16px rgba(0, 96, 107, 0.16);
-}
-
-.splash-start-button:hover {
-  filter: brightness(1.03) saturate(1.05);
-}
-
-.splash-start-button:active {
-  transform: translateY(1px);
-}
-
-.splash-start-button svg {
-  width: 22px;
-  height: 22px;
-}
-
-.splash-silent-button {
-  color: #32636d;
-  background: rgba(255, 255, 255, 0.68);
-  border: 1px solid rgba(40, 128, 137, 0.35);
-  box-shadow: inset 1px 1px 0 rgba(255, 255, 255, 0.9);
-}
-
-@keyframes splash-logo-await {
+@keyframes splash-logo-finish {
   0% {
     opacity: 0;
     transform: scale(0.82) translateY(8px);
     filter: blur(6px) drop-shadow(0 18px 25px rgba(0, 104, 129, 0));
   }
 
-  100% {
-    opacity: 1;
-    transform: scale(1) translateY(0);
-  }
-}
-
-@keyframes splash-name-await {
-  0% { opacity: 0; transform: translateY(6px); }
-  100% { opacity: 1; transform: translateY(0); }
-}
-
-@keyframes splash-actions-in {
-  0% { opacity: 0; transform: translateY(7px); }
-  100% { opacity: 1; transform: translateY(0); }
-}
-
-@keyframes splash-logo-finish {
-  0%,
+  18%,
   70% {
     opacity: 1;
     transform: scale(1);
@@ -375,7 +310,8 @@ button {
 }
 
 @keyframes splash-name-finish {
-  0%,
+  0% { opacity: 0; transform: translateY(6px); }
+  18%,
   70% { opacity: 1; transform: translateY(0); }
   100% { opacity: 0; transform: translateY(-4px); }
 }
@@ -1004,10 +940,14 @@ button {
   text-transform: uppercase;
 }
 
-.welcome-mark .flower-mark {
-  width: 26px;
-  height: 26px;
-  margin: -4px -3px;
+.welcome-mark .status-dot {
+  width: 8px;
+  height: 8px;
+  flex: 0 0 auto;
+  background: var(--oxalis-status-offline);
+  border: 1px solid color-mix(in srgb, var(--oxalis-outline) 52%, transparent);
+  border-radius: 50%;
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--oxalis-status-offline) 16%, transparent);
 }
 
 .welcome-mark.offline {
@@ -2502,7 +2442,6 @@ textarea:focus {
 
   .splash-logo,
   .splash-name,
-  .splash-actions,
   .splash-glow,
   .splash-screen::after {
     animation: none;
@@ -2540,22 +2479,6 @@ textarea:focus {
     font-size: 20px;
   }
 
-  .splash-actions {
-    width: min(100%, 430px);
-    margin-top: 8px;
-    grid-template-columns: 1fr 1fr;
-    gap: 7px;
-  }
-
-  .splash-actions p {
-    grid-column: 1 / -1;
-    font-size: 10px;
-  }
-
-  .splash-actions button {
-    min-height: 42px;
-    padding: 6px 12px;
-  }
 }
 
 @media (max-width: 760px), (max-height: 500px) and (hover: none) and (pointer: coarse) {
@@ -2581,12 +2504,12 @@ textarea:focus {
     display: grid;
     grid-template-columns: minmax(0, 1fr) auto;
     gap: 8px;
-    min-height: calc(54px + env(safe-area-inset-top, 0px));
+    min-height: calc(54px + var(--safe-top));
     padding:
-      calc(7px + env(safe-area-inset-top, 0px))
-      calc(10px + env(safe-area-inset-right, 0px))
+      calc(7px + var(--safe-top))
+      calc(10px + var(--safe-right))
       7px
-      calc(10px + env(safe-area-inset-left, 0px));
+      calc(10px + var(--safe-left));
     background: color-mix(in srgb, var(--desktop) 88%, transparent);
     border-bottom: 1px solid var(--line-soft);
   }
@@ -2625,18 +2548,18 @@ textarea:focus {
   }
 
   .diagnostics-panel > .window-titlebar {
-    min-height: calc(48px + env(safe-area-inset-top, 0px));
-    padding-top: calc(7px + env(safe-area-inset-top, 0px));
-    padding-right: calc(9px + env(safe-area-inset-right, 0px));
-    padding-left: calc(13px + env(safe-area-inset-left, 0px));
+    min-height: calc(48px + var(--safe-top));
+    padding-top: calc(7px + var(--safe-top));
+    padding-right: calc(9px + var(--safe-right));
+    padding-left: calc(13px + var(--safe-left));
   }
 
   .diagnostics-body {
     padding:
       13px
-      calc(13px + env(safe-area-inset-right, 0px))
-      calc(13px + env(safe-area-inset-bottom, 0px))
-      calc(13px + env(safe-area-inset-left, 0px));
+      calc(13px + var(--safe-right))
+      calc(13px + var(--safe-bottom))
+      calc(13px + var(--safe-left));
   }
 
   .diagnostics-body textarea {
@@ -2687,6 +2610,11 @@ textarea:focus {
     flex-direction: column;
   }
 
+  .app-shell:not(.chat-open) > .card > .window-titlebar > .flower-mark,
+  .app-shell:not(.chat-open) > .card > .window-titlebar > .window-controls {
+    display: none;
+  }
+
   .y2k-window {
     border-right: 0;
     border-bottom: 0;
@@ -2734,13 +2662,13 @@ textarea:focus {
   }
 
   .chat-card > .window-titlebar {
-    min-height: calc(48px + env(safe-area-inset-top, 0px));
+    min-height: calc(48px + var(--safe-top));
     gap: 6px;
     padding:
-      calc(7px + env(safe-area-inset-top, 0px))
-      calc(9px + env(safe-area-inset-right, 0px))
+      calc(7px + var(--safe-top))
+      calc(9px + var(--safe-right))
       7px
-      calc(13px + env(safe-area-inset-left, 0px));
+      calc(13px + var(--safe-left));
   }
 
   .chat-card > .window-titlebar > strong {
@@ -2776,9 +2704,9 @@ textarea:focus {
     gap: 4px;
     padding:
       6px
-      calc(6px + env(safe-area-inset-right, 0px))
+      calc(6px + var(--safe-right))
       6px
-      calc(6px + env(safe-area-inset-left, 0px));
+      calc(6px + var(--safe-left));
   }
 
   .chat-toolbar button {
@@ -2817,19 +2745,19 @@ textarea:focus {
   }
 
   .message-list {
-    padding-right: calc(16px + env(safe-area-inset-right, 0px));
-    padding-left: calc(16px + env(safe-area-inset-left, 0px));
+    padding-right: calc(16px + var(--safe-right));
+    padding-left: calc(16px + var(--safe-left));
   }
 
   .composer {
-    padding-right: calc(9px + env(safe-area-inset-right, 0px));
-    padding-left: calc(9px + env(safe-area-inset-left, 0px));
+    padding-right: calc(9px + var(--safe-right));
+    padding-left: calc(9px + var(--safe-left));
   }
 
   .security-panel {
     grid-template-columns: 1fr auto;
-    padding-right: calc(13px + env(safe-area-inset-right, 0px));
-    padding-left: calc(13px + env(safe-area-inset-left, 0px));
+    padding-right: calc(13px + var(--safe-right));
+    padding-left: calc(13px + var(--safe-left));
   }
 
   .security-panel p {
@@ -2882,13 +2810,13 @@ textarea:focus {
   }
 
   .chat-card > .window-statusbar {
-    min-height: calc(27px + env(safe-area-inset-bottom, 0px));
+    min-height: calc(27px + var(--safe-bottom));
     gap: 8px;
     padding:
       4px
-      calc(9px + env(safe-area-inset-right, 0px))
-      calc(4px + env(safe-area-inset-bottom, 0px))
-      calc(9px + env(safe-area-inset-left, 0px));
+      calc(9px + var(--safe-right))
+      calc(4px + var(--safe-bottom))
+      calc(9px + var(--safe-left));
   }
 
   .chat-card > .window-statusbar span:first-child {
@@ -2905,6 +2833,10 @@ textarea:focus {
 }
 
 @media (max-width: 640px) {
+  .chat-language-picker {
+    display: none;
+  }
+
   .topbar .brand-copy small {
     display: none;
   }
@@ -2957,7 +2889,6 @@ textarea:focus {
     display: none;
   }
 
-  .chat-language-picker,
   .top-sound-trigger {
     display: none;
   }
@@ -2994,9 +2925,9 @@ textarea:focus {
   .message-list {
     padding:
       10px
-      calc(10px + env(safe-area-inset-right, 0px))
+      calc(10px + var(--safe-right))
       10px
-      calc(10px + env(safe-area-inset-left, 0px));
+      calc(10px + var(--safe-left));
   }
 
   .message-actions-menu {
@@ -3023,9 +2954,9 @@ textarea:focus {
   .composer {
     padding:
       7px
-      calc(7px + env(safe-area-inset-right, 0px))
+      calc(7px + var(--safe-right))
       7px
-      calc(7px + env(safe-area-inset-left, 0px));
+      calc(7px + var(--safe-left));
   }
 
   .composer textarea {
@@ -3053,8 +2984,8 @@ textarea:focus {
 @media (max-width: 360px) {
   .topbar {
     gap: 4px;
-    padding-right: calc(6px + env(safe-area-inset-right, 0px));
-    padding-left: calc(6px + env(safe-area-inset-left, 0px));
+    padding-right: calc(6px + var(--safe-right));
+    padding-left: calc(6px + var(--safe-left));
   }
 
   .brand {
@@ -3100,8 +3031,8 @@ textarea:focus {
 
 @media (max-height: 500px) and (orientation: landscape) and (hover: none) and (pointer: coarse) {
   .chat-card > .window-titlebar {
-    min-height: calc(42px + env(safe-area-inset-top, 0px));
-    padding-top: calc(4px + env(safe-area-inset-top, 0px));
+    min-height: calc(42px + var(--safe-top));
+    padding-top: calc(4px + var(--safe-top));
     padding-bottom: 4px;
   }
 
@@ -3150,8 +3081,23 @@ textarea:focus {
   }
 
   .chat-card > .window-statusbar {
-    min-height: calc(24px + env(safe-area-inset-bottom, 0px));
+    min-height: calc(24px + var(--safe-bottom));
     padding-top: 2px;
-    padding-bottom: calc(2px + env(safe-area-inset-bottom, 0px));
+    padding-bottom: calc(2px + var(--safe-bottom));
+  }
+}
+
+@media (display-mode: standalone) and (max-width: 760px),
+  (display-mode: standalone) and (max-height: 500px) and (hover: none) and (pointer: coarse) {
+  .app-shell {
+    height: 100vh;
+  }
+}
+
+@supports (-webkit-touch-callout: none) {
+  @media (orientation: portrait) and (hover: none) and (pointer: coarse) {
+    :root {
+      --mobile-status-bar-fallback: 24px;
+    }
   }
 }

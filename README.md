@@ -19,7 +19,7 @@ A minimal private chat between two browsers. The signaling server only relays SD
 - complete local chat clearing, or a request to clear both copies with the peer's explicit consent;
 - English, Polish, Russian, and Ukrainian interfaces with browser-language detection and a locally remembered manual choice;
 - a theme-aware animated oxalis mark that folds while offline and opens for a secure session;
-- optional startup, connection, and disconnection cues generated locally with Web Audio, with a remembered mute setting;
+- startup, connection, and disconnection cues generated locally with Web Audio, enabled by default with a remembered mute setting;
 - reload recovery in the same tab: both browsers build a fresh WebRTC transport and fresh E2EE session while preserving local history and the verified peer identity;
 - no accounts, server-side database, or server-side message history.
 
@@ -43,6 +43,8 @@ A browser reload always destroys its `RTCPeerConnection`; a live WebRTC connecti
 After a reload, DirectTalk rejoins the signaling room, creates a new peer connection, performs a fresh ephemeral-key handshake, and refuses a different device identity. The other browser moves into a visible reconnecting state and temporarily disables sending, photo transfer, and remote deletion until the new secure channel is ready. Pending text packets are safely requeued with their existing UUIDs; the receiver deduplicates them. Interrupted photos are marked failed instead of being uploaded again without user intent. Choosing **Close**, **Home**, or **Cancel connection** explicitly deletes the recovery record.
 
 This is session recovery, not an account login. If both browsers are offline at different times, DirectTalk has no server inbox and cannot deliver messages later. A restrictive network still needs a working TURN route.
+
+Conversation history is matched to the remote browser profile's long-lived public identity key, not to its nickname or invitation link. A new invitation to the same browser profile therefore opens the same locally stored thread even if the nickname changed. A different browser profile, private-browsing session, device, or cleared site data creates a different identity and a separate thread. Each participant has an independent local copy; the server never reconstructs or synchronizes history.
 
 ## Deploy to Vercel
 

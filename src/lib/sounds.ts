@@ -45,7 +45,7 @@ class AppSoundPlayer {
     this.enabled = enabled;
   }
 
-  async play(cue: SoundCue): Promise<boolean> {
+  async play(cue: SoundCue, { resume = true }: { resume?: boolean } = {}): Promise<boolean> {
     if (!this.enabled) return false;
     if (cue === "startup" && this.startupPlayed) return true;
     if (typeof window === "undefined" || (document.visibilityState && document.visibilityState !== "visible")) return false;
@@ -56,7 +56,10 @@ class AppSoundPlayer {
     try {
       if (!this.context || this.context.state === "closed") this.context = new Constructor();
       const context = this.context;
-      if (context.state === "suspended") await context.resume();
+      if (context.state === "suspended") {
+        if (!resume) return false;
+        await context.resume();
+      }
       if (!this.enabled || context.state !== "running") return false;
       if (cue === "startup" && this.startupPlayed) return true;
 

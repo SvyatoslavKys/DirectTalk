@@ -73,6 +73,11 @@ type DeleteScope = "local" | "everyone";
 
 const SPLASH_DURATION_MS = 1_900;
 const SPLASH_REDUCED_DURATION_MS = 650;
+const THEME_COLORS: Record<ThemeId, string> = {
+  lime: "#dcece7",
+  aqua: "#dcecf2",
+  midnight: "#121323",
+};
 
 interface DeleteConfirmation {
   messageId: string;
@@ -174,7 +179,6 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeId>(() => readTheme());
   const [soundsEnabled, setSoundsEnabled] = useState(() => readSoundEnabled());
   const [showSplash, setShowSplash] = useState(true);
-  const [splashStarted, setSplashStarted] = useState(() => !soundsEnabled);
   const [resumableSession, setResumableSession] = useState(() => readResumableSession());
   const connectionRef = useRef<DirectTalkConnection | null>(null);
   const peerRef = useRef<SecurePeer | null>(null);
@@ -196,6 +200,7 @@ export default function App() {
   const connectionGenerationRef = useRef(0);
   const chatGenerationRef = useRef(0);
   const previousScreenRef = useRef<Screen>("loading");
+  const startupSoundAtRef = useRef(Number.NEGATIVE_INFINITY);
 
   const invalidInvite = useMemo(
     () => window.location.hash.startsWith("#invite=") && !incomingInvite,
@@ -203,6 +208,32 @@ export default function App() {
   );
 
   useEffect(() => initializeDiagnostics(), []);
+
+  useEffect(() => {
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+
+    let frame: number | null = null;
+    const syncViewportTop = () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      frame = window.requestAnimationFrame(() => {
+        frame = null;
+        const top = Math.min(80, Math.max(0, Math.round(viewport.offsetTop)));
+        document.documentElement.style.setProperty("--visual-viewport-top", `${top}px`);
+      });
+    };
+
+    syncViewportTop();
+    viewport.addEventListener("resize", syncViewportTop);
+    viewport.addEventListener("scroll", syncViewportTop);
+    window.addEventListener("pageshow", syncViewportTop);
+    return () => {
+      if (frame !== null) window.cancelAnimationFrame(frame);
+      viewport.removeEventListener("resize", syncViewportTop);
+      viewport.removeEventListener("scroll", syncViewportTop);
+      window.removeEventListener("pageshow", syncViewportTop);
+    };
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -261,14 +292,13 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    if (!splashStarted) return;
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const timer = window.setTimeout(
       () => setShowSplash(false),
       reduceMotion ? SPLASH_REDUCED_DURATION_MS : SPLASH_DURATION_MS,
     );
     return () => window.clearTimeout(timer);
-  }, [splashStarted]);
+  }, []);
 
   useEffect(() => {
     appSounds.setEnabled(soundsEnabled);
@@ -276,14 +306,68 @@ export default function App() {
   }, [soundsEnabled]);
 
   useEffect(() => {
+    if (!soundsEnabled) return;
+
+    let active = true;
+    let deferredLogged = false;
+    const removeFallbackListeners = () => {
+      window.removeEventListener("click", retryAfterInteraction);
+      window.removeEventListener("keyup", retryAfterInteraction);
+    };
+    const tryStartupSound = async (source: "load" | "interaction") => {
+      const played = await appSounds.play("startup", { resume: source === "interaction" });
+      if (!active) return;
+      if (played) {
+        startupSoundAtRef.current = performance.now();
+        removeFallbackListeners();
+        logDiagnostic("app", "startup-sound-played", { source });
+      } else if (source === "load" && !deferredLogged) {
+        deferredLogged = true;
+        logDiagnostic("app", "startup-sound-deferred", { reason: "autoplay-policy" });
+      }
+    };
+    function retryAfterInteraction(event: Event) {
+      removeFallbackListeners();
+      if (event.target instanceof Element && event.target.closest("[data-sound-control]")) return;
+      void tryStartupSound("interaction");
+    }
+
+    window.addEventListener("click", retryAfterInteraction);
+    window.addEventListener("keyup", retryAfterInteraction);
+    const timer = window.setTimeout(() => void tryStartupSound("load"), 80);
+
+    return () => {
+      active = false;
+      window.clearTimeout(timer);
+      removeFallbackListeners();
+    };
+  }, [soundsEnabled]);
+
+  useEffect(() => {
     const previous = previousScreenRef.current;
-    if (screen === "chat" && previous !== "chat") void appSounds.play("connect");
-    if (previous === "chat" && screen !== "chat") void appSounds.play("disconnect");
     previousScreenRef.current = screen;
-  }, [screen]);
+    if (showSplash) {
+      return;
+    }
+    let connectTimer: number | null = null;
+    if (screen === "chat" && previous !== "chat") {
+      const startupElapsed = performance.now() - startupSoundAtRef.current;
+      const delay = Math.max(0, 720 - startupElapsed);
+      if (delay > 0) {
+        connectTimer = window.setTimeout(() => void appSounds.play("connect"), delay);
+      } else {
+        void appSounds.play("connect");
+      }
+    }
+    if (previous === "chat" && screen !== "chat") void appSounds.play("disconnect");
+    return () => {
+      if (connectTimer !== null) window.clearTimeout(connectTimer);
+    };
+  }, [screen, showSplash]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
+    document.querySelector<HTMLMetaElement>('meta[name="theme-color"]')?.setAttribute("content", THEME_COLORS[theme]);
     try {
       localStorage.setItem("directtalk.theme", theme);
     } catch {
@@ -1270,24 +1354,6 @@ export default function App() {
     if (next) void appSounds.play("startup");
   }
 
-  function startSplashWithSound() {
-    appSounds.setEnabled(true);
-    writeSoundEnabled(true);
-    setSoundsEnabled(true);
-    setSplashStarted(true);
-    void appSounds.play("startup").then((played) => {
-      logDiagnostic("app", played ? "startup-sound-played" : "startup-sound-unavailable", undefined, played ? "info" : "warn");
-    });
-  }
-
-  function startSplashSilently() {
-    appSounds.setEnabled(false);
-    writeSoundEnabled(false);
-    setSoundsEnabled(false);
-    setSplashStarted(true);
-    logDiagnostic("app", "startup-sound-skipped");
-  }
-
   function reset() {
     logDiagnostic("app", "returned-home");
     connectionGenerationRef.current += 1;
@@ -1350,22 +1416,8 @@ export default function App() {
 
   return (
     <>
-      {showSplash && (
-        <SplashScreen
-          started={splashStarted}
-          onStartWithSound={startSplashWithSound}
-          onStartSilent={startSplashSilently}
-          openLabel={t("splash.openSound")}
-          silentLabel={t("splash.silent")}
-          hint={t("splash.hint")}
-        />
-      )}
-      <main
-        className={`app-shell ${isConversationOpen ? "chat-open" : ""}`}
-        data-theme={theme}
-        aria-hidden={showSplash || undefined}
-        inert={showSplash || undefined}
-      >
+      {showSplash && <SplashScreen />}
+      <main className={`app-shell ${isConversationOpen ? "chat-open" : ""}`} data-theme={theme}>
       <header className="topbar">
         <button className="brand" type="button" onClick={screen === "home" ? undefined : reset} aria-label={t("top.home")}>
           <OxalisMark state={logoState} />
@@ -1421,7 +1473,7 @@ export default function App() {
                     {theme === option.id && <span className="menu-check">✓</span>}
                   </button>
                 ))}
-                <button className="sound-menu-button" type="button" onClick={toggleSounds} aria-pressed={soundsEnabled}>
+                <button className="sound-menu-button" data-sound-control type="button" onClick={toggleSounds} aria-pressed={soundsEnabled}>
                   <SpeakerIcon muted={!soundsEnabled} />
                   {soundsEnabled ? t("sound.on") : t("sound.off")}
                   <span className="menu-check">{soundsEnabled ? "✓" : "—"}</span>
@@ -1454,7 +1506,7 @@ export default function App() {
         <section className="card home-card y2k-window">
           <WindowTitlebar title={incomingInvite ? t("home.incomingWindow") : t("home.newWindow")} markState="offline" />
           <div className="home-body">
-            <div className="welcome-mark offline"><OxalisMark state="offline" /><span>{t("peer.offline")}</span></div>
+            <div className="welcome-mark offline"><i className="status-dot" aria-hidden="true" /><span>{t("peer.offline")}</span></div>
             <div className="eyebrow">{t("home.eyebrow")}</div>
             <h1>{incomingInvite ? t("home.invitedTitle") : t("home.greetingTitle")}</h1>
             <p className="lead">{t("home.lead")}</p>
@@ -1816,42 +1868,20 @@ export default function App() {
   );
 }
 
-function SplashScreen({
-  started,
-  onStartWithSound,
-  onStartSilent,
-  openLabel,
-  silentLabel,
-  hint,
-}: {
-  started: boolean;
-  onStartWithSound: () => void;
-  onStartSilent: () => void;
-  openLabel: string;
-  silentLabel: string;
-  hint: string;
-}) {
+function SplashScreen() {
+  const [markState, setMarkState] = useState<OxalisState>("offline");
+
+  useEffect(() => {
+    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+    const timer = window.setTimeout(() => setMarkState("online"), reduceMotion ? 0 : 280);
+    return () => window.clearTimeout(timer);
+  }, []);
+
   return (
-    <div
-      className={`splash-screen ${started ? "started" : "awaiting-start"}`}
-      role="dialog"
-      aria-modal="true"
-      aria-labelledby="splash-title"
-      aria-describedby={started ? undefined : "splash-hint"}
-    >
+    <div className="splash-screen started" aria-hidden="true">
       <div className="splash-glow" />
-      <OxalisMark className="splash-logo" state={started ? "online" : "offline"} />
-      <span className="splash-name" id="splash-title">DirectTalk</span>
-      {!started && (
-        <div className="splash-actions">
-          <p id="splash-hint">{hint}</p>
-          <button className="splash-start-button" type="button" onClick={onStartWithSound} autoFocus>
-            <SpeakerIcon muted={false} />
-            {openLabel}
-          </button>
-          <button className="splash-silent-button" type="button" onClick={onStartSilent}>{silentLabel}</button>
-        </div>
-      )}
+      <OxalisMark className="splash-logo" state={markState} />
+      <span className="splash-name">DirectTalk</span>
     </div>
   );
 }
@@ -2044,6 +2074,7 @@ function SoundToggle({
   return (
     <button
       className={`sound-trigger ${enabled ? "enabled" : "muted"} ${className}`.trim()}
+      data-sound-control
       type="button"
       onClick={onToggle}
       aria-label={label}
