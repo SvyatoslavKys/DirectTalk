@@ -64,7 +64,7 @@ export function decodeInvitationSecret(invitation: Invitation): Uint8Array<Array
   return secret;
 }
 
-function parseInvitation(value: unknown): Invitation {
+export function parseInvitation(value: unknown): Invitation {
   if (!value || typeof value !== "object") throw new Error("Некорректное приглашение");
   const invitation = value as Record<string, unknown>;
   if (

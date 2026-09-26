@@ -59,14 +59,19 @@ import {
 } from "./lib/diagnostics";
 import { APP_VERSION } from "./lib/version";
 import { appSounds, readSoundEnabled, writeSoundEnabled } from "./lib/sounds";
+import {
+  clearResumableSession,
+  readResumableSession,
+  updateResumablePeerIdentity,
+  writeResumableSession,
+} from "./lib/sessionResume";
 
 type Screen = "loading" | "home" | "waiting" | "chat" | "error";
 type ThemeId = "lime" | "aqua" | "midnight";
 type PhotoTransferStatus = "preparing" | "waiting" | "transferring" | "receiving" | "complete" | "declined" | "cancelled" | "failed";
 type DeleteScope = "local" | "everyone";
 
-const SPLASH_OPEN_DELAY_MS = 650;
-const SPLASH_DURATION_MS = 2_400;
+const SPLASH_DURATION_MS = 1_900;
 const SPLASH_REDUCED_DURATION_MS = 650;
 
 interface DeleteConfirmation {
@@ -108,6 +113,8 @@ const stateLabelKeys: Record<ConnectionState, TranslationKey> = {
   "connecting-signaling": "state.connectingSignaling",
   "waiting-peer": "state.waitingPeer",
   "connecting-peer": "state.connectingPeer",
+  reconnecting: "state.reconnecting",
+  "waiting-reconnect": "state.waitingReconnect",
   authenticating: "state.authenticating",
   secure: "state.secure",
   closed: "state.closed",
@@ -167,6 +174,8 @@ export default function App() {
   const [theme, setTheme] = useState<ThemeId>(() => readTheme());
   const [soundsEnabled, setSoundsEnabled] = useState(() => readSoundEnabled());
   const [showSplash, setShowSplash] = useState(true);
+  const [splashStarted, setSplashStarted] = useState(() => !soundsEnabled);
+  const [resumableSession, setResumableSession] = useState(() => readResumableSession());
   const connectionRef = useRef<DirectTalkConnection | null>(null);
   const peerRef = useRef<SecurePeer | null>(null);
   const messageListRef = useRef<HTMLDivElement | null>(null);
@@ -184,6 +193,7 @@ export default function App() {
   const incomingClearRequestRef = useRef<string | null>(null);
   const pendingClearRequestRef = useRef<string | null>(null);
   const pendingClearTimerRef = useRef<number | null>(null);
+  const connectionGenerationRef = useRef(0);
   const chatGenerationRef = useRef(0);
   const previousScreenRef = useRef<Screen>("loading");
 
@@ -195,24 +205,52 @@ export default function App() {
   useEffect(() => initializeDiagnostics(), []);
 
   useEffect(() => {
+    let active = true;
     if (!window.isSecureContext || !crypto.subtle || !window.RTCPeerConnection) {
       showFatalError(translate(language, "error.browser"), "browser-requirements");
-      return;
+      return () => {
+        active = false;
+      };
     }
     logDiagnostic("app", "browser-requirements-ok");
     void getOrCreateIdentity()
       .then((keys) => {
+        if (!active) return;
         logDiagnostic("identity", "ready");
         setIdentity(keys);
         if (invalidInvite) {
           showFatalError(translate(language, "error.invite"), "invitation-validation");
+        } else if (!incomingInvite && resumableSession) {
+          if (resumableSession.role === "creator" && resumableSession.invitation.creatorIdentity !== keys.publicKeyRaw) {
+            clearResumableSession();
+            setResumableSession(null);
+            setScreen("home");
+            return;
+          }
+          setDisplayName(resumableSession.displayName);
+          setInvitation(resumableSession.invitation);
+          if (resumableSession.role === "creator" && !resumableSession.expectedPeerIdentity) {
+            setInviteLink(invitationUrl(resumableSession.invitation));
+          }
+          setConnectionState("reconnecting");
+          setScreen("waiting");
+          logDiagnostic("app", "session-resume-started", { role: resumableSession.role });
+          startConnection(resumableSession.invitation, resumableSession.role, keys, {
+            resume: true,
+            expectedPeerIdentity: resumableSession.expectedPeerIdentity,
+            displayName: resumableSession.displayName,
+          });
         } else {
           setScreen("home");
         }
       })
       .catch((reason: unknown) => {
+        if (!active) return;
         showFatalError(reason instanceof Error ? reason.message : translate(language, "error.identity"), "identity-setup");
       });
+    return () => {
+      active = false;
+    };
   }, [invalidInvite]);
 
   useEffect(() => () => {
@@ -223,44 +261,18 @@ export default function App() {
   }, []);
 
   useEffect(() => {
+    if (!splashStarted) return;
     const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
     const timer = window.setTimeout(
       () => setShowSplash(false),
       reduceMotion ? SPLASH_REDUCED_DURATION_MS : SPLASH_DURATION_MS,
     );
     return () => window.clearTimeout(timer);
-  }, []);
+  }, [splashStarted]);
 
   useEffect(() => {
     appSounds.setEnabled(soundsEnabled);
     writeSoundEnabled(soundsEnabled);
-  }, [soundsEnabled]);
-
-  useEffect(() => {
-    if (!soundsEnabled) return;
-    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    let listening = true;
-    let startupTimer: number | null = null;
-    const removeUnlockListeners = () => {
-      if (!listening) return;
-      listening = false;
-      if (startupTimer !== null) window.clearTimeout(startupTimer);
-      window.removeEventListener("pointerdown", unlockSound, true);
-      window.removeEventListener("keydown", unlockSound, true);
-    };
-    const tryStartupSound = () => {
-      void appSounds.play("startup").then((played) => {
-        if (played) removeUnlockListeners();
-      });
-    };
-    function unlockSound() {
-      tryStartupSound();
-    }
-
-    window.addEventListener("pointerdown", unlockSound, { capture: true });
-    window.addEventListener("keydown", unlockSound, { capture: true });
-    startupTimer = window.setTimeout(tryStartupSound, reduceMotion ? 0 : SPLASH_OPEN_DELAY_MS);
-    return removeUnlockListeners;
   }, [soundsEnabled]);
 
   useEffect(() => {
@@ -327,21 +339,31 @@ export default function App() {
     if (!identity || !validateName()) return;
     const nextInvitation = createInvitation(identity);
     const link = invitationUrl(nextInvitation);
+    writeResumableSession({
+      invitation: nextInvitation,
+      role: "creator",
+      displayName: displayName.trim().normalize("NFC"),
+    });
     setInvitation(nextInvitation);
     setInviteLink(link);
     setScreen("waiting");
     logDiagnostic("app", "creator-started");
-    startConnection(nextInvitation, "creator");
+    startConnection(nextInvitation, "creator", identity);
   }
 
   function startJoiner(event: FormEvent) {
     event.preventDefault();
     if (!identity || !incomingInvite || !validateName()) return;
+    writeResumableSession({
+      invitation: incomingInvite,
+      role: "joiner",
+      displayName: displayName.trim().normalize("NFC"),
+    });
     clearInvitationFromAddressBar();
     setInvitation(incomingInvite);
     setScreen("waiting");
     logDiagnostic("app", "joiner-started");
-    startConnection(incomingInvite, "joiner");
+    startConnection(incomingInvite, "joiner", identity);
     setIncomingInvite(null);
   }
 
@@ -361,26 +383,41 @@ export default function App() {
     return true;
   }
 
-  function startConnection(nextInvitation: Invitation, role: PeerRole) {
+  function startConnection(
+    nextInvitation: Invitation,
+    role: PeerRole,
+    activeIdentity: IdentityKeys,
+    options: { resume?: boolean; expectedPeerIdentity?: string; displayName?: string } = {},
+  ) {
+    const generation = connectionGenerationRef.current + 1;
+    connectionGenerationRef.current = generation;
     connectionRef.current?.close();
     let directConnection: DirectTalkConnection;
     directConnection = new DirectTalkConnection({
       roomId: nextInvitation.roomId,
       inviteSecret: decodeInvitationSecret(nextInvitation),
       role,
-      identity: identity!,
-      displayName: displayName.trim().normalize("NFC"),
+      identity: activeIdentity,
+      displayName: options.displayName ?? displayName.trim().normalize("NFC"),
       expectedCreatorIdentity: role === "joiner" ? nextInvitation.creatorIdentity : undefined,
+      expectedPeerIdentity: options.expectedPeerIdentity,
+      resume: options.resume,
       onState: (state) => {
+        if (generation !== connectionGenerationRef.current) return;
         logDiagnostic("app", "connection-state", { state });
         setConnectionState(state);
       },
       onSecure: (securePeer) => {
+        if (generation !== connectionGenerationRef.current) return;
         logDiagnostic("app", "secure-peer-ready");
-        void handleSecurePeer(securePeer).catch(handleLocalError);
+        void handleSecurePeer(securePeer, generation).catch(handleLocalError);
       },
-      onPayload: (payload) => handlePayload(directConnection, payload),
+      onPayload: (payload) => {
+        if (generation !== connectionGenerationRef.current) return;
+        return handlePayload(directConnection, payload);
+      },
       onError: (message) => {
+        if (generation !== connectionGenerationRef.current) return;
         showFatalError(message, "connection-callback");
       },
     });
@@ -388,11 +425,13 @@ export default function App() {
     directConnection.connect();
   }
 
-  async function handleSecurePeer(securePeer: SecurePeer) {
+  async function handleSecurePeer(securePeer: SecurePeer, generation: number) {
+    if (generation !== connectionGenerationRef.current) return;
     sessionStartedAtRef.current = Date.now();
     peerRef.current = securePeer;
     setPeer(securePeer);
     const existing = await db.contacts.get(securePeer.id);
+    if (generation !== connectionGenerationRef.current) return;
     const now = Date.now();
     const nextContact: StoredContact = {
       id: securePeer.id,
@@ -404,15 +443,61 @@ export default function App() {
       lastSeenAt: now,
     };
     await db.contacts.put(nextContact);
+    if (generation !== connectionGenerationRef.current) return;
     const [history, storedAttachments] = await Promise.all([
       loadMessages(securePeer.id),
       loadAttachments(securePeer.id),
     ]);
+    if (generation !== connectionGenerationRef.current) return;
+    const interruptedPhotoIds = history
+      .filter((message) => message.sender === "me" && message.kind === "photo" && message.status === "sending")
+      .map((message) => message.id);
+    if (interruptedPhotoIds.length) {
+      await Promise.all(interruptedPhotoIds.map((id) => db.messages.update(id, { status: "failed" })));
+      if (generation !== connectionGenerationRef.current) return;
+      for (const id of interruptedPhotoIds) {
+        outgoingPhotosRef.current.delete(id);
+        sendingPhotosRef.current.delete(id);
+      }
+    }
+    const recoveredHistory = history.map((message) => (
+      interruptedPhotoIds.includes(message.id) ? { ...message, status: "failed" as const } : message
+    ));
     setContact(nextContact);
-    setMessages(history);
+    setMessages((current) => mergeStoredMessages(recoveredHistory, current));
     setAttachments(indexAttachments(storedAttachments));
+    if (interruptedPhotoIds.length) {
+      setPhotoTransfers((current) => {
+        const next = { ...current };
+        for (const id of interruptedPhotoIds) {
+          if (next[id]) next[id] = { ...next[id], status: "failed", error: t("photo.transferFailed") };
+        }
+        return next;
+      });
+    }
+    updateResumablePeerIdentity(securePeer.identityKey);
     logDiagnostic("storage", "chat-history-loaded", { messages: history.length, attachments: storedAttachments.length });
     setScreen("chat");
+    await resendPendingTextMessages(recoveredHistory, generation);
+  }
+
+  async function resendPendingTextMessages(history: StoredMessage[], generation: number) {
+    const connection = connectionRef.current;
+    if (!connection) return;
+    const pending = history.filter((message) => (
+      message.sender === "me" && message.kind !== "photo" && message.status === "sending"
+    ));
+    for (const message of pending) {
+      if (generation !== connectionGenerationRef.current || connection !== connectionRef.current) return;
+      try {
+        await connection.send({ kind: "chat-message", id: message.id, text: message.text, createdAt: message.createdAt });
+        beginDeliveryWatch(message.id);
+        logDiagnostic("chat", "pending-message-requeued");
+      } catch (reason) {
+        logDiagnostic("chat", "pending-message-requeue-failed", { reason: safeErrorText(reason) }, "warn");
+        return;
+      }
+    }
   }
 
   function showFatalError(message: string, stage: string) {
@@ -743,7 +828,7 @@ export default function App() {
 
     const currentPeer = peerRef.current;
     const connection = connectionRef.current;
-    if (!text || text.length > 4_000 || !currentPeer || !connection) return;
+    if (!text || text.length > 4_000 || !currentPeer || !connection || connectionState !== "secure") return;
 
     const message: StoredMessage = {
       id: crypto.randomUUID(),
@@ -772,7 +857,7 @@ export default function App() {
   async function handlePhotoSelection(event: ChangeEvent<HTMLInputElement>) {
     const file = event.currentTarget.files?.[0];
     event.currentTarget.value = "";
-    if (!file) return;
+    if (!file || connectionState !== "secure") return;
 
     const id = crypto.randomUUID();
     const createdAt = Date.now();
@@ -1185,14 +1270,35 @@ export default function App() {
     if (next) void appSounds.play("startup");
   }
 
+  function startSplashWithSound() {
+    appSounds.setEnabled(true);
+    writeSoundEnabled(true);
+    setSoundsEnabled(true);
+    setSplashStarted(true);
+    void appSounds.play("startup").then((played) => {
+      logDiagnostic("app", played ? "startup-sound-played" : "startup-sound-unavailable", undefined, played ? "info" : "warn");
+    });
+  }
+
+  function startSplashSilently() {
+    appSounds.setEnabled(false);
+    writeSoundEnabled(false);
+    setSoundsEnabled(false);
+    setSplashStarted(true);
+    logDiagnostic("app", "startup-sound-skipped");
+  }
+
   function reset() {
     logDiagnostic("app", "returned-home");
+    connectionGenerationRef.current += 1;
     chatGenerationRef.current += 1;
     for (const id of outgoingPhotosRef.current.keys()) cancelledPhotosRef.current.add(id);
     for (const id of incomingPhotosRef.current.keys()) cancelledPhotosRef.current.add(id);
     connectionRef.current?.close();
     connectionRef.current = null;
     peerRef.current = null;
+    clearResumableSession();
+    setResumableSession(null);
     clearInvitationFromAddressBar();
     setPeer(null);
     setContact(null);
@@ -1214,6 +1320,7 @@ export default function App() {
     setDeleteConfirmation(null);
     setShowClearDialog(false);
     setHistoryNotice("");
+    setDraft("");
     setInvitation(null);
     setIncomingInvite(null);
     setInviteLink("");
@@ -1221,6 +1328,7 @@ export default function App() {
     setErrorDiagnosticId(null);
     setShowEmoji(false);
     setShowSecurity(false);
+    setConnectionState("closed");
     setScreen("home");
   }
 
@@ -1232,16 +1340,32 @@ export default function App() {
     (transfer) => transfer.direction === "incoming" && transfer.status !== "complete",
   );
   const isConversationOpen = screen === "chat";
+  const connectionReady = connectionState === "secure";
+  const chatMarkState: OxalisState = connectionReady ? "online" : "connecting";
   const logoState: OxalisState = isConversationOpen
-    ? "online"
+    ? chatMarkState
     : screen === "loading" || screen === "waiting"
       ? "connecting"
       : "offline";
 
   return (
     <>
-      {showSplash && <SplashScreen />}
-      <main className={`app-shell ${isConversationOpen ? "chat-open" : ""}`} data-theme={theme}>
+      {showSplash && (
+        <SplashScreen
+          started={splashStarted}
+          onStartWithSound={startSplashWithSound}
+          onStartSilent={startSplashSilently}
+          openLabel={t("splash.openSound")}
+          silentLabel={t("splash.silent")}
+          hint={t("splash.hint")}
+        />
+      )}
+      <main
+        className={`app-shell ${isConversationOpen ? "chat-open" : ""}`}
+        data-theme={theme}
+        aria-hidden={showSplash || undefined}
+        inert={showSplash || undefined}
+      >
       <header className="topbar">
         <button className="brand" type="button" onClick={screen === "home" ? undefined : reset} aria-label={t("top.home")}>
           <OxalisMark state={logoState} />
@@ -1346,7 +1470,6 @@ export default function App() {
                   maxLength={40}
                   autoComplete="nickname"
                   placeholder={t("home.namePlaceholder")}
-                  autoFocus
                 />
               </div>
               {error && <p className="inline-error">{localizeRuntimeMessage(language, error)}</p>}
@@ -1379,9 +1502,13 @@ export default function App() {
           <div className="waiting-body">
             <div className="pulse-lock"><LockIcon /></div>
             <div className="eyebrow">{t(stateLabelKeys[connectionState])}</div>
-            <h1>{connectionState === "waiting-peer" ? t("waiting.invite") : t("waiting.channel")}</h1>
+            <h1>{connectionState === "waiting-peer" || (connectionState === "waiting-reconnect" && inviteLink)
+              ? t("waiting.invite")
+              : connectionState === "reconnecting" || connectionState === "waiting-reconnect"
+                ? t("waiting.restore")
+                : t("waiting.channel")}</h1>
 
-            {inviteLink && connectionState === "waiting-peer" && (
+            {inviteLink && (connectionState === "waiting-peer" || connectionState === "waiting-reconnect") && (
               <div className="invite-layout">
                 {qrCode && <img className="qr-code" src={qrCode} alt={t("waiting.qrAlt")} />}
                 <div className="invite-details">
@@ -1408,7 +1535,7 @@ export default function App() {
             title={`${activePeer.name} — ${t("chat.title")}`}
             onClose={reset}
             closeLabel={t("common.close")}
-            markState="online"
+            markState={chatMarkState}
             extra={(
               <div className="chat-title-actions">
                 <SoundToggle
@@ -1440,17 +1567,25 @@ export default function App() {
             type="file"
             accept="image/jpeg,image/png,image/webp,image/gif"
             onChange={(event) => void handlePhotoSelection(event)}
+            disabled={!connectionReady}
             tabIndex={-1}
           />
 
           <nav className="chat-toolbar" aria-label={t("chat.tools")}>
             <button className="active" type="button"><span>▤</span>{t("chat.messages")}</button>
-            <button type="button" onClick={() => photoInputRef.current?.click()} title={t("chat.photoTooltip")}><span>▧</span>{t("chat.photo")}<small>{t("chat.upTo10")}</small></button>
+            <button type="button" onClick={() => photoInputRef.current?.click()} disabled={!connectionReady} title={t("chat.photoTooltip")}><span>▧</span>{t("chat.photo")}<small>{t("chat.upTo10")}</small></button>
             <button type="button" disabled title={t("chat.voiceTooltip")}><span>◉</span>{t("chat.voice")}<small>{t("chat.soon")}</small></button>
             <button type="button" disabled title={t("chat.callTooltip")}><span>☎</span>{t("chat.call")}<small>{t("chat.soon")}</small></button>
             <button type="button" onClick={() => setShowClearDialog(true)} disabled={Boolean(pendingClearRequest)} title={t("chat.clearTooltip")}><span>⌫</span>{t("chat.clear")}<small>{pendingClearRequest ? t("chat.waiting") : t("chat.history")}</small></button>
             <button className="security-tool" type="button" onClick={() => setShowSecurity(!showSecurity)}><span>◆</span>{t("chat.security")}</button>
           </nav>
+
+          {!connectionReady && (
+            <div className="reconnect-banner" role="status" aria-live="polite">
+              <OxalisMark state="connecting" />
+              <div><strong>{t("peer.reconnecting")}</strong><span>{t("chat.reconnecting")}</span></div>
+            </div>
+          )}
 
           {showSecurity && (
             <aside className="security-panel">
@@ -1470,7 +1605,7 @@ export default function App() {
           <div className="chat-workspace">
             <div className="conversation-pane">
               <div className="message-list" ref={messageListRef} aria-live="polite">
-                <div className="session-notice"><LockIcon /> {t("session.secure")} · {formatTime(sessionStartedAtRef.current, language)}</div>
+                {connectionReady && <div className="session-notice"><LockIcon /> {t("session.secure")} · {formatTime(sessionStartedAtRef.current, language)}</div>}
                 {incomingClearRequest && (
                   <section className="history-clear-request" role="alert">
                     <div><strong>{t("clearRequest.title", { name: activePeer.name })}</strong><span>{t("clearRequest.description")}</span></div>
@@ -1506,9 +1641,9 @@ export default function App() {
                 ))}
                 {activeMessages.length === 0 && incomingPhotoOffers.length === 0 && incomingTransfers.length === 0 && (
                   <div className="empty-chat">
-                    <OxalisMark state="online" />
-                    <strong>{t("empty.online", { name: activePeer.name })}</strong>
-                    <span>{t("empty.prompt")}</span>
+                    <OxalisMark state={chatMarkState} />
+                    <strong>{connectionReady ? t("empty.online", { name: activePeer.name }) : t("peer.reconnecting")}</strong>
+                    <span>{connectionReady ? t("empty.prompt") : t("chat.reconnecting")}</span>
                   </div>
                 )}
                 {activeMessages.map((message) => (
@@ -1541,7 +1676,7 @@ export default function App() {
                           setDeleteConfirmation({ messageId: message.id, scope: "local" });
                         }}>{t("message.deleteLocal")}</button>
                         {message.sender === "me" && (
-                          <button type="button" role="menuitem" onClick={() => {
+                          <button type="button" role="menuitem" disabled={!connectionReady} onClick={() => {
                             setMessageMenuId(null);
                             setDeleteConfirmation({ messageId: message.id, scope: "everyone" });
                           }}>{t("message.deleteEveryone")}</button>
@@ -1592,19 +1727,19 @@ export default function App() {
                       aria-expanded={showEmoji}
                       title={t("emoji.label")}
                     >☺</button>
-                    <button type="button" onClick={() => photoInputRef.current?.click()} title={t("composer.photoTooltip")}>📎</button>
+                    <button type="button" onClick={() => photoInputRef.current?.click()} disabled={!connectionReady} title={t("composer.photoTooltip")}>📎</button>
                     <button type="button" disabled title={t("composer.voiceTooltip")}>🎙</button>
                   </div>
                   <span className="draft-counter">{draft.length}/4000</span>
-                  <button className="send-button" type="submit" disabled={!draft.trim()}>{t("common.send")}</button>
+                  <button className="send-button" type="submit" disabled={!draft.trim() || !connectionReady}>{t("common.send")}</button>
                 </div>
               </form>
             </div>
 
             <aside className="peer-sidebar">
               <div className="peer-avatar" aria-hidden="true">{activePeer.name.slice(0, 1).toUpperCase()}</div>
-              <div className="peer-online"><OxalisMark state="online" /><strong>{activePeer.name}</strong></div>
-              <span className="presence">● {t("peer.online")}</span>
+              <div className="peer-online"><OxalisMark state={chatMarkState} /><strong>{activePeer.name}</strong></div>
+              <span className={`presence ${connectionReady ? "" : "reconnecting"}`}>● {connectionReady ? t("peer.online") : t("peer.reconnecting")}</span>
               <div className="peer-divider" />
               <button type="button" className={activeContact.verified ? "verified" : ""} onClick={() => setShowSecurity(!showSecurity)}>
                 <LockIcon />
@@ -1648,14 +1783,14 @@ export default function App() {
                 </div>
                 <div className="clear-dialog-options">
                   <button type="button" onClick={() => void clearOnlyThisBrowser()}><strong>{t("clear.local")}</strong><span>{t("clear.localDescription")}</span></button>
-                  <button type="button" onClick={() => void requestClearForEveryone()}><strong>{t("clear.everyone")}</strong><span>{t("clear.everyoneDescription")}</span></button>
+                  <button type="button" onClick={() => void requestClearForEveryone()} disabled={!connectionReady}><strong>{t("clear.everyone")}</strong><span>{t("clear.everyoneDescription")}</span></button>
                 </div>
                 <div className="confirm-dialog-actions"><button type="button" onClick={() => setShowClearDialog(false)}>{t("common.cancel")}</button></div>
               </section>
             </div>
           )}
 
-          <div className="window-statusbar"><span>● {activePeer.name}: {t("peer.online")}</span><span>{t("status.messages", { count: activeMessages.length })}</span><span>WebRTC · E2EE</span></div>
+          <div className="window-statusbar"><span>● {activePeer.name}: {connectionReady ? t("peer.online") : t("peer.reconnecting")}</span><span>{t("status.messages", { count: activeMessages.length })}</span><span>{connectionReady ? "WebRTC · E2EE" : t("state.reconnecting")}</span></div>
         </section>
       )}
 
@@ -1681,25 +1816,42 @@ export default function App() {
   );
 }
 
-function SplashScreen() {
-  const [markState, setMarkState] = useState<OxalisState>("offline");
-
-  useEffect(() => {
-    const reduceMotion = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
-    if (reduceMotion) {
-      setMarkState("online");
-      return;
-    }
-
-    const timer = window.setTimeout(() => setMarkState("online"), SPLASH_OPEN_DELAY_MS);
-    return () => window.clearTimeout(timer);
-  }, []);
-
+function SplashScreen({
+  started,
+  onStartWithSound,
+  onStartSilent,
+  openLabel,
+  silentLabel,
+  hint,
+}: {
+  started: boolean;
+  onStartWithSound: () => void;
+  onStartSilent: () => void;
+  openLabel: string;
+  silentLabel: string;
+  hint: string;
+}) {
   return (
-    <div className="splash-screen" aria-hidden="true">
+    <div
+      className={`splash-screen ${started ? "started" : "awaiting-start"}`}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="splash-title"
+      aria-describedby={started ? undefined : "splash-hint"}
+    >
       <div className="splash-glow" />
-      <OxalisMark className="splash-logo" state={markState} />
-      <span className="splash-name">DirectTalk</span>
+      <OxalisMark className="splash-logo" state={started ? "online" : "offline"} />
+      <span className="splash-name" id="splash-title">DirectTalk</span>
+      {!started && (
+        <div className="splash-actions">
+          <p id="splash-hint">{hint}</p>
+          <button className="splash-start-button" type="button" onClick={onStartWithSound} autoFocus>
+            <SpeakerIcon muted={false} />
+            {openLabel}
+          </button>
+          <button className="splash-silent-button" type="button" onClick={onStartSilent}>{silentLabel}</button>
+        </div>
+      )}
     </div>
   );
 }
@@ -1929,6 +2081,12 @@ async function acknowledgeMessage(connection: DirectTalkConnection, messageId: s
 function upsertMessage(messages: StoredMessage[], message: StoredMessage): StoredMessage[] {
   const withoutExisting = messages.filter((item) => item.id !== message.id);
   return [...withoutExisting, message].sort((left, right) => left.createdAt - right.createdAt);
+}
+
+function mergeStoredMessages(history: StoredMessage[], current: StoredMessage[]): StoredMessage[] {
+  const merged = new Map(history.map((message) => [message.id, message]));
+  for (const message of current) merged.set(message.id, message);
+  return [...merged.values()].sort((left, right) => left.createdAt - right.createdAt);
 }
 
 function indexAttachments(items: StoredAttachment[]): Record<string, StoredAttachment> {

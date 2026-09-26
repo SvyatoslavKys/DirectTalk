@@ -36,6 +36,8 @@ export type ConnectionState =
   | "connecting-signaling"
   | "waiting-peer"
   | "connecting-peer"
+  | "reconnecting"
+  | "waiting-reconnect"
   | "authenticating"
   | "secure"
   | "closed";
@@ -82,6 +84,8 @@ interface ConnectionOptions {
   identity: IdentityKeys;
   displayName: string;
   expectedCreatorIdentity?: string;
+  expectedPeerIdentity?: string;
+  resume?: boolean;
   onState: (state: ConnectionState) => void;
   onSecure: (peer: SecurePeer) => void;
   onPayload: (payload: Exclude<AppPayload, { kind: "session-ready" }>) => void | Promise<void>;
@@ -152,13 +156,19 @@ export class DirectTalkConnection {
   private rxPackets = 0;
   private rtcConfig?: RTCConfiguration;
   private startPromise?: Promise<void>;
+  private sessionReconnectActive: boolean;
+  private pinnedPeerIdentity?: string;
+  private hasEstablishedSession = false;
 
-  constructor(private readonly options: ConnectionOptions) {}
+  constructor(private readonly options: ConnectionOptions) {
+    this.sessionReconnectActive = Boolean(options.resume);
+    this.pinnedPeerIdentity = options.expectedPeerIdentity;
+  }
 
   connect(): void {
     if (this.socket || this.startPromise || this.closed || this.secureNotified) return;
     this.trace("connect", { role: this.options.role });
-    this.options.onState("connecting-signaling");
+    this.options.onState(this.sessionReconnectActive ? "reconnecting" : "connecting-signaling");
     const operation = this.startConnection();
     this.startPromise = operation;
     void operation
@@ -205,7 +215,7 @@ export class DirectTalkConnection {
     socket.addEventListener("open", () => {
       if (this.socket !== socket || this.closed) return;
       this.trace("signaling-open");
-      if (!this.recovering) this.reconnectAttempts = 0;
+      if (!this.recovering && !this.sessionReconnectActive) this.reconnectAttempts = 0;
       socket.send(JSON.stringify({ type: "join", roomId: this.options.roomId, role: this.options.role }));
       this.trace("signaling-join-sent");
     });
@@ -405,14 +415,14 @@ export class DirectTalkConnection {
       if (generation !== this.peerGeneration || this.closed) return;
       this.trace("data-channel-closed", { state: channel.readyState }, "warn");
       void this.captureTransportSnapshot("data-channel-closed");
-      if (this.secureNotified) this.fail(new Error("Прямое соединение закрыто"), "data-channel-close");
+      if (this.secureNotified) this.beginSessionReconnect("data-channel-close");
       else this.failUnavailableInitialIceRetry("data-channel-close", new Error("Прямое соединение закрыто"));
     });
     channel.addEventListener("error", () => {
       if (generation !== this.peerGeneration) return;
       this.trace("data-channel-error", { state: channel.readyState }, "error");
       void this.captureTransportSnapshot("data-channel-error");
-      if (this.secureNotified) this.fail(new Error("Ошибка WebRTC DataChannel"), "data-channel-error");
+      if (this.secureNotified) this.beginSessionReconnect("data-channel-error");
       else this.failUnavailableInitialIceRetry("data-channel-error", new Error("Ошибка WebRTC DataChannel"));
     });
   }
@@ -422,33 +432,39 @@ export class DirectTalkConnection {
     const message = JSON.parse(raw) as Record<string, unknown>;
     this.trace("signaling-message", { type: typeof message.type === "string" ? message.type : "invalid" });
     if (message.type === "joined") {
-      if (!this.secureNotified && !this.recovering) this.options.onState("waiting-peer");
+      if (!this.secureNotified && !this.recovering) {
+        this.options.onState(this.sessionReconnectActive ? "waiting-reconnect" : "waiting-peer");
+      }
       return;
     }
     if (message.type === "peer-ready") {
       this.signalingPeerReady = true;
       if (this.secureNotified) {
-        if (!this.recovering) this.startIceRecovery("peer-ready");
-        if (!this.recovering) return;
-        this.trace("ice-recovery-peer-ready", { attempt: this.recoveryAttempts });
-        if (this.options.role === "creator") await this.createRecoveryOffer();
+        this.beginSessionReconnect("peer-ready");
         return;
       }
-      this.options.onState("connecting-peer");
+      this.options.onState(this.sessionReconnectActive ? "reconnecting" : "connecting-peer");
       if (this.options.role === "creator") await this.createOffer();
       return;
     }
     if (message.type === "peer-left") {
       if (this.recovering) {
         this.handleRecoveryAttemptFailure("peer-left");
-      } else if (!this.secureNotified) {
+      } else if (this.secureNotified) {
+        this.beginSessionReconnect("peer-left");
+      } else {
         this.resetPeerConnection();
         this.setupPeerConnection();
-        this.options.onState("waiting-peer");
+        this.options.onState(this.sessionReconnectActive ? "waiting-reconnect" : "waiting-peer");
       }
       return;
     }
     if (message.type === "error") {
+      if (message.code === "room-full" && this.sessionReconnectActive && !this.secureNotified) {
+        this.trace("session-reconnect-room-busy", { attempt: this.reconnectAttempts + 1 }, "warn");
+        this.socket?.close(1012, "Resume retry");
+        return;
+      }
       if (this.recovering) {
         this.handleRecoveryAttemptFailure("signaling-error");
         return;
@@ -730,7 +746,9 @@ export class DirectTalkConnection {
         this.options.inviteSecret,
         this.options.role,
         this.options.expectedCreatorIdentity,
+        this.pinnedPeerIdentity,
       );
+      this.pinnedPeerIdentity ??= remote.hello.identityKey;
       this.remoteHello = remote.hello;
       this.trace("handshake-identity-verified");
       this.session = await deriveSession(local, remote, this.options.inviteSecret);
@@ -785,14 +803,18 @@ export class DirectTalkConnection {
 
   private notifySecureIfReady(): void {
     if (!this.session || !this.remoteHello || !this.sentSessionReady || !this.receivedSessionReady || this.secureNotified) return;
+    const reconnected = this.sessionReconnectActive || this.hasEstablishedSession;
     this.secureNotified = true;
+    this.sessionReconnectActive = false;
+    this.hasEstablishedSession = true;
+    this.reconnectAttempts = 0;
     this.cancelInitialIceFailureTimer();
     this.cancelInitialIceAttemptTimer();
     this.initialIceRetryActive = false;
     this.initialIceRefreshPending = false;
     this.initialIceRetryGeneration += 1;
     this.initialIcePreparation = undefined;
-    this.trace("secure-session-established");
+    this.trace(reconnected ? "secure-session-restored" : "secure-session-established");
     this.options.onState("secure");
     this.options.onSecure({
       id: this.session.peerId,
@@ -851,7 +873,7 @@ export class DirectTalkConnection {
       this.trace("ice-recovery-grace-started", { delay: DISCONNECTED_GRACE_MS }, "warn");
       this.disconnectedTimer = window.setTimeout(() => {
         this.disconnectedTimer = undefined;
-        if (this.peerConnection?.connectionState === "disconnected") this.startIceRecovery("disconnected");
+        if (this.peerConnection?.connectionState === "disconnected") this.beginSessionReconnect("disconnected");
       }, DISCONNECTED_GRACE_MS);
       return;
     }
@@ -860,7 +882,7 @@ export class DirectTalkConnection {
       this.cancelSignalingClose();
       if (this.disconnectedTimer !== undefined) window.clearTimeout(this.disconnectedTimer);
       this.disconnectedTimer = undefined;
-      if (this.secureNotified) this.startIceRecovery("failed");
+      if (this.secureNotified) this.beginSessionReconnect("failed");
       else this.scheduleInitialIceRetry("failed", peerConnection);
       return;
     }
@@ -1058,11 +1080,11 @@ export class DirectTalkConnection {
   private startIceRecovery(trigger: string): void {
     if (this.closed || this.recovering) return;
     if (!this.secureNotified || !this.session || !this.peerConnection || this.dataChannel?.readyState !== "open") {
-      this.fail(new Error("Не удалось восстановить прямое соединение"), "ice-recovery-unavailable");
+      this.beginSessionReconnect("ice-recovery-unavailable");
       return;
     }
     if (this.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
-      this.fail(new Error("Не удалось восстановить WebRTC-соединение"), "ice-recovery-exhausted");
+      this.beginSessionReconnect("ice-recovery-exhausted");
       return;
     }
 
@@ -1129,7 +1151,7 @@ export class DirectTalkConnection {
     this.closeSignalingSocket("recovery-retry");
 
     if (this.recoveryAttempts >= MAX_RECOVERY_ATTEMPTS) {
-      this.fail(new Error("Не удалось восстановить WebRTC-соединение"), "ice-recovery-exhausted");
+      this.beginSessionReconnect("ice-recovery-exhausted");
       return;
     }
 
@@ -1423,7 +1445,7 @@ export class DirectTalkConnection {
     const delay = Math.min(500 * 2 ** this.reconnectAttempts, 5_000);
     this.reconnectAttempts += 1;
     this.trace("signaling-reconnect-scheduled", { attempt: this.reconnectAttempts, delay }, "warn");
-    this.options.onState("connecting-signaling");
+    this.options.onState(this.sessionReconnectActive ? "reconnecting" : "connecting-signaling");
     this.reconnectTimer = window.setTimeout(() => {
       this.reconnectTimer = undefined;
       if (this.closed || this.secureNotified) return;
@@ -1472,6 +1494,30 @@ export class DirectTalkConnection {
     this.recoveryNegotiated = false;
     this.recoverySawChecking = false;
     this.awaitingRecoveryRemoteDescription = false;
+  }
+
+  private beginSessionReconnect(trigger: string): void {
+    if (this.closed || (this.sessionReconnectActive && !this.secureNotified)) return;
+    this.trace("session-reconnect-started", { trigger }, "warn");
+    this.cancelSignalingClose();
+    if (this.disconnectedTimer !== undefined) window.clearTimeout(this.disconnectedTimer);
+    if (this.recoveryTimer !== undefined) window.clearTimeout(this.recoveryTimer);
+    if (this.reconnectTimer !== undefined) window.clearTimeout(this.reconnectTimer);
+    this.disconnectedTimer = undefined;
+    this.recoveryTimer = undefined;
+    this.reconnectTimer = undefined;
+    this.pinnedPeerIdentity ??= this.remoteHello?.identityKey;
+    this.sessionReconnectActive = true;
+    this.secureNotified = false;
+    this.closeSignalingSocket("session-reconnect");
+    this.resetPeerConnection();
+    this.options.onState("reconnecting");
+    try {
+      this.setupPeerConnection();
+      this.openSignalingSocket();
+    } catch (error) {
+      this.fail(error, "session-reconnect-setup");
+    }
   }
 
   private sendSignal(payload: Record<string, unknown>): boolean {

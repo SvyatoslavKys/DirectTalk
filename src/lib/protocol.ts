@@ -127,11 +127,15 @@ export async function verifyRemoteHello(
   inviteSecret: Uint8Array<ArrayBuffer>,
   localRole: PeerRole,
   expectedCreatorIdentity?: string,
+  expectedRemoteIdentity?: string,
 ): Promise<VerifiedHello> {
   const hello = parseHello(value);
   if (hello.roomId !== roomId || hello.role === localRole) throw new Error("Handshake относится к другому чату");
   if (hello.role === "creator" && expectedCreatorIdentity && hello.identityKey !== expectedCreatorIdentity) {
     throw new Error("Ключ создателя не совпадает с ключом в приглашении");
+  }
+  if (expectedRemoteIdentity && hello.identityKey !== expectedRemoteIdentity) {
+    throw new Error("Ключ собеседника изменился при восстановлении соединения");
   }
 
   const identityBytes = decodeFixed(hello.identityKey, 65, "ключ устройства");

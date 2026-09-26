@@ -20,6 +20,7 @@ A minimal private chat between two browsers. The signaling server only relays SD
 - English, Polish, Russian, and Ukrainian interfaces with browser-language detection and a locally remembered manual choice;
 - a theme-aware animated oxalis mark that folds while offline and opens for a secure session;
 - optional startup, connection, and disconnection cues generated locally with Web Audio, with a remembered mute setting;
+- reload recovery in the same tab: both browsers build a fresh WebRTC transport and fresh E2EE session while preserving local history and the verified peer identity;
 - no accounts, server-side database, or server-side message history.
 
 ## Production architecture on Vercel
@@ -33,7 +34,15 @@ DirectTalk deploys as one Vercel project:
 - once the encrypted DataChannel handshake succeeds, both browsers close their signaling WebSockets and continue peer to peer;
 - Redis Cloud coordinates signaling sockets that land on different Vercel Function instances and rate-limits TURN credential requests using a keyed hash of the client address. It never stores messages, photos, names, encryption keys, raw IP addresses, or TURN secrets.
 
-Vercel WebSocket Functions have a maximum lifetime. Before WebRTC is ready, the browser reconnects to signaling automatically. After WebRTC is ready, signaling is no longer needed.
+Vercel WebSocket Functions have a maximum lifetime. Before WebRTC is ready, the browser reconnects to signaling automatically. After WebRTC is ready, signaling is no longer needed unless one browser reloads or the established transport must be rebuilt.
+
+## Reload and reconnection model
+
+A browser reload always destroys its `RTCPeerConnection`; a live WebRTC connection cannot be serialized and resumed. DirectTalk therefore keeps a validated, 12-hour recovery record in that tab's `sessionStorage`. It contains the invitation capability, role, local display name, and—after the first successful handshake—the authenticated peer identity. It does not contain ephemeral ECDH keys, AES session keys, packet counters, messages, or files.
+
+After a reload, DirectTalk rejoins the signaling room, creates a new peer connection, performs a fresh ephemeral-key handshake, and refuses a different device identity. The other browser moves into a visible reconnecting state and temporarily disables sending, photo transfer, and remote deletion until the new secure channel is ready. Pending text packets are safely requeued with their existing UUIDs; the receiver deduplicates them. Interrupted photos are marked failed instead of being uploaded again without user intent. Choosing **Close**, **Home**, or **Cancel connection** explicitly deletes the recovery record.
+
+This is session recovery, not an account login. If both browsers are offline at different times, DirectTalk has no server inbox and cannot deliver messages later. A restrictive network still needs a working TURN route.
 
 ## Deploy to Vercel
 
@@ -65,7 +74,7 @@ npm run test:signal
 
 WebSockets on Vercel are currently a Public Beta. DirectTalk requests short-lived TURN credentials before creating the peer connection. Without private provider variables, the endpoint uses Metered's public static-auth Open Relay service for testing. If the endpoint or relay is unavailable, the browser falls back to STUN-only mode, which can still fail between restrictive networks and is reported in Diagnostics.
 
-DirectTalk exchanges explicit end-of-candidates markers before releasing signaling. A failed initial route is retried with fresh TURN credentials and up to two bounded ICE restarts on the existing peer connection. If an established route is briefly lost, both browsers preserve the encrypted DataChannel, reopen signaling when needed, and make up to two bounded ICE-restart attempts before reporting a fatal connection error.
+DirectTalk exchanges explicit end-of-candidates markers before releasing signaling. A failed initial route is retried with fresh TURN credentials and bounded ICE restarts. If an established route is briefly lost, DirectTalk first allows a short browser-level recovery grace period. A hard failure or reload then rebuilds the WebRTC transport and negotiates fresh E2EE session keys through signaling while pinning the previously authenticated device identity.
 
 ## Local development
 
@@ -125,6 +134,7 @@ src/lib/photos.ts      image validation, chunking, and hashing
 src/lib/i18n.ts        translations, language detection, and runtime-error localization
 src/lib/diagnostics.ts privacy-safe in-browser connection diagnostics
 src/lib/sounds.ts      local procedural interface sounds and their preference
+src/lib/sessionResume.ts validated, expiring same-tab reload context
 src/lib/database.ts    device key, contacts, messages, and attachments
 server/signaling.mjs   signaling protocol and in-memory/Redis coordination
 server/index.mjs       local signaling-server entrypoint

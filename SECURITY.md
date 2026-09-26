@@ -43,7 +43,7 @@ PairDrop uses WebRTC and a server without a database, but the project [separatel
 8. The shared ECDH secret is passed to HKDF-SHA-256. The `inviteSecret` is used as the salt, and the complete transcript hash is used as context. HKDF independently derives two AES-256-GCM keys and two directional nonce prefixes.
 9. The participants exchange an initial encrypted `session-ready` message. The chat becomes available only after bidirectional key confirmation.
 10. Every AES-GCM packet receives a 96-bit nonce: `direction-prefix || uint64 sequence`. The room, direction, and sequence number are included in the additional authenticated data. A skipped or repeated sequence number closes the connection.
-11. The safety code is derived from an HMAC of the invitation secret and complete handshake transcript. Participants compare this code over an independent channel. After verification, the contact's identity key is treated as pinned.
+11. The safety code is derived from an HMAC of the invitation secret and complete handshake transcript. Participants compare this code over an independent channel. After the first authenticated session, both roles pin the remote identity for same-tab reload recovery; a different identity causes a hard security failure.
 
 This design uses fresh session keys but does not implement a Double Ratchet within a session. Offline delivery and post-compromise security should use a reviewed protocol implementation such as the [Signal Double Ratchet](https://signal.org/docs/specifications/doubleratchet/) instead of extending this design with an improvised ratchet. Signal also [requires authentication of identity keys](https://signal.org/docs/specifications/sesame/#authentication), for example by comparing a fingerprint or QR code.
 
@@ -76,6 +76,8 @@ DirectTalk does not strip EXIF or other embedded metadata. Images are transferre
 ## Local history
 
 Message text and sent or received images are currently stored as plaintext in IndexedDB. Meaningful encryption at rest requires a separate user secret or system key store; placing a key next to the ciphertext in the same browser profile does not honestly protect against a compromised origin. The interface can delete an individual message or clear the current chat. Complete removal of all data for the origin is still performed through the browser's site-data settings.
+
+For reload recovery, the current tab also keeps the invitation capability, participant role, display name, and pinned remote identity in `sessionStorage` for at most 12 hours. This record survives reload but is removed by an explicit exit and is normally scoped to that tab. It never stores the ephemeral ECDH private key, derived AES keys, or sequence counters: every recovered connection performs a new handshake and derives fresh keys and nonce prefixes. Anyone who can read the origin's browser storage or execute JavaScript in the origin can also read this recovery capability.
 
 ## Deletion semantics
 

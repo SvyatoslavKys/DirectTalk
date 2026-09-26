@@ -468,25 +468,25 @@ describe("ICE recovery", () => {
     expect(firstSocket.send).not.toHaveBeenCalled();
   });
 
-  it("waits through a short disconnect before starting recovery", async () => {
+  it("waits through a short disconnect before rebuilding the secure session", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("window", { setTimeout, clearTimeout });
     const connection = await createTestConnection();
-    const startIceRecovery = vi.fn();
+    const beginSessionReconnect = vi.fn();
     const peerConnection = {
       connectionState: "disconnected",
       getStats: vi.fn().mockResolvedValue(new Map()),
     };
-    Object.assign(connection, { secureNotified: true, peerConnection, startIceRecovery });
+    Object.assign(connection, { secureNotified: true, peerConnection, beginSessionReconnect });
     const internal = connection as unknown as {
       handlePeerConnectionStateChange: (peer: RTCPeerConnection) => void;
     };
 
     internal.handlePeerConnectionStateChange(peerConnection as unknown as RTCPeerConnection);
     await vi.advanceTimersByTimeAsync(1_499);
-    expect(startIceRecovery).not.toHaveBeenCalled();
+    expect(beginSessionReconnect).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(1);
-    expect(startIceRecovery).toHaveBeenCalledWith("disconnected");
+    expect(beginSessionReconnect).toHaveBeenCalledWith("disconnected");
   });
 
   it("cancels recovery when a short disconnect reconnects inside the grace period", async () => {
@@ -513,37 +513,57 @@ describe("ICE recovery", () => {
     expect(startIceRecovery).not.toHaveBeenCalled();
   });
 
-  it("treats a post-secure peer-ready event as a restart request", async () => {
+  it("treats a post-secure peer-ready event as a fresh secure-session request", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("window", { setTimeout, clearTimeout });
     vi.stubGlobal("WebSocket", { OPEN: 1 });
     const connection = await createTestConnection("creator");
-    const offer = { type: "offer", sdp: "restart-sdp" } satisfies RTCSessionDescriptionInit;
-    const peerConnection = {
-      connectionState: "connected",
-      iceConnectionState: "connected",
-      signalingState: "stable",
-      createOffer: vi.fn().mockResolvedValue(offer),
-      setLocalDescription: vi.fn().mockImplementation(async () => {
-        peerConnection.signalingState = "have-local-offer";
-      }),
-    };
-    const socket = { readyState: 1, send: vi.fn() };
+    const beginSessionReconnect = vi.fn();
     Object.assign(connection, {
       secureNotified: true,
-      session: {},
-      dataChannel: { readyState: "open" },
-      peerConnection,
-      socket,
-      offerStarted: true,
+      beginSessionReconnect,
     });
     const internal = connection as unknown as { handleSignalMessage: (raw: string) => Promise<void> };
 
     await internal.handleSignalMessage(JSON.stringify({ type: "peer-ready" }));
 
-    expect(peerConnection.createOffer).toHaveBeenCalledWith({ iceRestart: true });
-    expect(sentSignal(socket.send)).toMatchObject({ type: "signal", payload: { description: offer } });
-    expect((sentSignal(socket.send).payload as Record<string, unknown>).iceGeneration).toMatch(/^[A-Za-z0-9_-]{16}$/u);
+    expect(beginSessionReconnect).toHaveBeenCalledWith("peer-ready");
+  });
+
+  it("pins the peer identity and creates a fresh transport for session recovery", async () => {
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+    const connection = await createTestConnection("creator");
+    const setupPeerConnection = vi.fn();
+    const openSignalingSocket = vi.fn();
+    const resetPeerConnection = vi.fn();
+    const closeSignalingSocket = vi.fn();
+    const peerIdentity = base64UrlEncode(randomBytes(65));
+    Object.assign(connection, {
+      secureNotified: true,
+      remoteHello: { identityKey: peerIdentity },
+      setupPeerConnection,
+      openSignalingSocket,
+      resetPeerConnection,
+      closeSignalingSocket,
+    });
+    const internal = connection as unknown as {
+      beginSessionReconnect: (trigger: string) => void;
+      pinnedPeerIdentity?: string;
+      sessionReconnectActive: boolean;
+      secureNotified: boolean;
+      options: { onState: ReturnType<typeof vi.fn> };
+    };
+
+    internal.beginSessionReconnect("data-channel-close");
+
+    expect(internal.pinnedPeerIdentity).toBe(peerIdentity);
+    expect(internal.sessionReconnectActive).toBe(true);
+    expect(internal.secureNotified).toBe(false);
+    expect(closeSignalingSocket).toHaveBeenCalledWith("session-reconnect");
+    expect(resetPeerConnection).toHaveBeenCalledTimes(1);
+    expect(setupPeerConnection).toHaveBeenCalledTimes(1);
+    expect(openSignalingSocket).toHaveBeenCalledTimes(1);
+    expect(internal.options.onState).toHaveBeenCalledWith("reconnecting");
   });
 
   it("answers a post-secure restart offer even before its own disconnect event", async () => {

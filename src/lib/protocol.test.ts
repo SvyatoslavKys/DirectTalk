@@ -54,6 +54,36 @@ describe("DirectTalk cryptographic handshake", () => {
     );
   });
 
+  it("pins either role to the previously authenticated peer during a restored session", async () => {
+    const roomId = base64UrlEncode(randomBytes(16));
+    const secret = randomBytes(32);
+    const [creatorIdentity, originalJoiner, replacementJoiner] = await Promise.all([
+      createIdentityKeys(),
+      createIdentityKeys(),
+      createIdentityKeys(),
+    ]);
+    const creator = await createLocalHandshake(creatorIdentity, roomId, secret, "creator", "Alice");
+    const replacement = await createLocalHandshake(replacementJoiner, roomId, secret, "joiner", "Mallory");
+
+    await expect(verifyRemoteHello(
+      replacement.hello,
+      roomId,
+      secret,
+      "creator",
+      undefined,
+      originalJoiner.publicKeyRaw,
+    )).rejects.toThrow("Ключ собеседника изменился");
+    await expect(verifyRemoteHello(
+      replacement.hello,
+      roomId,
+      secret,
+      "creator",
+      undefined,
+      replacementJoiner.publicKeyRaw,
+    )).resolves.toMatchObject({ hello: { identityKey: replacementJoiner.publicKeyRaw } });
+    expect(creator.hello.identityKey).toBe(creatorIdentity.publicKeyRaw);
+  });
+
   it("hides identity metadata inside a secret-protected handshake envelope", async () => {
     const roomId = base64UrlEncode(randomBytes(16));
     const secret = randomBytes(32);

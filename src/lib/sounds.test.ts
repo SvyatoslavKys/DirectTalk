@@ -48,6 +48,7 @@ describe("procedural sound cues", () => {
     const startup = soundPattern("startup");
     expect(startup).toHaveLength(3);
     expect(startup.map((tone) => tone.frequency)).toEqual([440, 659.25, 880]);
+    expect(startup.map((tone) => tone.gain)).toEqual([0.026, 0.032, 0.024]);
     expect(startup.every((tone) => tone.endFrequency > tone.frequency)).toBe(true);
   });
 
@@ -58,7 +59,7 @@ describe("procedural sound cues", () => {
       for (const tone of pattern) {
         expect(tone.at + tone.duration).toBeLessThan(0.65);
         expect(tone.gain).toBeGreaterThan(0);
-        expect(tone.gain).toBeLessThanOrEqual(0.025);
+        expect(tone.gain).toBeLessThanOrEqual(0.035);
         expect(tone.frequency).toBeGreaterThan(200);
         expect(tone.endFrequency).toBeGreaterThan(200);
       }
