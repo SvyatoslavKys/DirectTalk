@@ -18,6 +18,8 @@ A minimal private chat between two browsers. The signaling server only relays SD
 - local deletion of any message and confirmed deletion of the user's own sent messages from both participants;
 - complete local chat clearing, or a request to clear both copies with the peer's explicit consent;
 - English, Polish, Russian, and Ukrainian interfaces with browser-language detection and a locally remembered manual choice;
+- a theme-aware animated oxalis mark that folds while offline and opens for a secure session;
+- optional startup, connection, and disconnection cues generated locally with Web Audio, with a remembered mute setting;
 - no accounts, server-side database, or server-side message history.
 
 ## Production architecture on Vercel
@@ -122,6 +124,7 @@ src/lib/connection.ts  WebRTC, signaling, and the encrypted messaging protocol
 src/lib/photos.ts      image validation, chunking, and hashing
 src/lib/i18n.ts        translations, language detection, and runtime-error localization
 src/lib/diagnostics.ts privacy-safe in-browser connection diagnostics
+src/lib/sounds.ts      local procedural interface sounds and their preference
 src/lib/database.ts    device key, contacts, messages, and attachments
 server/signaling.mjs   signaling protocol and in-memory/Redis coordination
 server/index.mjs       local signaling-server entrypoint

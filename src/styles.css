@@ -31,6 +31,21 @@
   --danger: #c64436;
   --shadow: rgba(29, 87, 69, 0.24);
   --gloss: rgba(255, 255, 255, 0.7);
+  --oxalis-outline: #421332;
+  --oxalis-vein: #f4b6d4;
+  --oxalis-stem: #8da956;
+  --oxalis-top-light: #df649f;
+  --oxalis-top-mid: #932f70;
+  --oxalis-top-dark: #3c1435;
+  --oxalis-left-light: #c94f90;
+  --oxalis-left-mid: #76275f;
+  --oxalis-left-dark: #30122d;
+  --oxalis-right-light: #ef79b5;
+  --oxalis-right-mid: #a53b7c;
+  --oxalis-right-dark: #49153f;
+  --oxalis-status-offline: #897985;
+  --oxalis-status-connecting: #f0ad35;
+  --oxalis-status-online: #65b938;
 }
 
 :root[data-theme="aqua"] {
@@ -55,6 +70,21 @@
   --button-text: #123b45;
   --peer: #4f63b6;
   --shadow: rgba(27, 88, 105, 0.24);
+  --oxalis-outline: #233156;
+  --oxalis-vein: #d9f9ff;
+  --oxalis-stem: #4d9d91;
+  --oxalis-top-light: #8b8bea;
+  --oxalis-top-mid: #5750ad;
+  --oxalis-top-dark: #292650;
+  --oxalis-left-light: #61d7d2;
+  --oxalis-left-mid: #288f9b;
+  --oxalis-left-dark: #174b60;
+  --oxalis-right-light: #dc71bd;
+  --oxalis-right-mid: #8d3e8f;
+  --oxalis-right-dark: #3d214f;
+  --oxalis-status-offline: #73858d;
+  --oxalis-status-connecting: #f1b74d;
+  --oxalis-status-online: #43bca5;
 }
 
 :root[data-theme="midnight"] {
@@ -86,6 +116,21 @@
   --danger: #ff8a7d;
   --shadow: rgba(0, 0, 0, 0.46);
   --gloss: rgba(255, 255, 255, 0.3);
+  --oxalis-outline: #241633;
+  --oxalis-vein: #ffe0f3;
+  --oxalis-stem: #84b687;
+  --oxalis-top-light: #ff94cc;
+  --oxalis-top-mid: #b64c9e;
+  --oxalis-top-dark: #521c60;
+  --oxalis-left-light: #aea3ff;
+  --oxalis-left-mid: #6856c1;
+  --oxalis-left-dark: #2d275e;
+  --oxalis-right-light: #6ce1dc;
+  --oxalis-right-mid: #368fa5;
+  --oxalis-right-dark: #214764;
+  --oxalis-status-offline: #85849f;
+  --oxalis-status-connecting: #ffc55f;
+  --oxalis-status-online: #72d26b;
 }
 
 * {
@@ -193,6 +238,11 @@ button {
   user-select: none;
   filter: drop-shadow(0 18px 25px rgba(0, 104, 129, 0.22));
   animation: splash-logo-intro 2.3s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+.flower-mark.splash-logo {
+  width: clamp(180px, 29vw, 360px);
+  height: clamp(180px, 29vw, 360px);
 }
 
 .splash-name {
@@ -352,14 +402,188 @@ button {
   display: inline-grid;
   place-items: center;
   flex: 0 0 auto;
-  filter: drop-shadow(0 2px 2px rgba(0, 95, 119, 0.24));
+  filter: drop-shadow(0 2px 2px color-mix(in srgb, var(--oxalis-outline) 38%, transparent));
+  transition: filter 320ms ease, opacity 320ms ease;
 }
 
-.flower-mark img {
+.oxalis-mark__svg {
   width: 100%;
   height: 100%;
   display: block;
-  object-fit: contain;
+  overflow: visible;
+}
+
+.oxalis-mark__stem-shadow,
+.oxalis-mark__stem {
+  fill: none;
+  stroke-linecap: round;
+}
+
+.oxalis-mark__stem-shadow {
+  stroke: color-mix(in srgb, var(--oxalis-outline) 55%, transparent);
+  stroke-width: 4.6px;
+}
+
+.oxalis-mark__stem {
+  stroke: var(--oxalis-stem);
+  stroke-width: 2.8px;
+}
+
+.oxalis-mark__leaf {
+  --open-angle: 0deg;
+  --closed-angle: 150deg;
+  --leaf-delay: 0ms;
+  transform: rotate(var(--closed-angle)) translateY(1px);
+  transform-box: view-box;
+  transform-origin: 36px 39px;
+  transition: transform 620ms cubic-bezier(0.22, 0.82, 0.2, 1);
+}
+
+.oxalis-mark__leaf--left {
+  --open-angle: -118deg;
+  --closed-angle: 180deg;
+  --leaf-delay: 55ms;
+}
+
+.oxalis-mark__leaf--right {
+  --open-angle: 118deg;
+  --closed-angle: 210deg;
+  --leaf-delay: 110ms;
+}
+
+.oxalis-mark__leaf-shape {
+  transform: scaleX(0.48) scaleY(0.94);
+  transform-box: view-box;
+  transform-origin: 36px 38px;
+  transition: transform 620ms cubic-bezier(0.22, 0.82, 0.2, 1);
+}
+
+.oxalis-mark__leaf-fill {
+  stroke: var(--oxalis-outline);
+  stroke-width: 1.25px;
+  stroke-linejoin: round;
+}
+
+.oxalis-mark__vein,
+.oxalis-mark__shine {
+  fill: none;
+  stroke-linecap: round;
+}
+
+.oxalis-mark__vein {
+  stroke: var(--oxalis-vein);
+  stroke-width: 1.15px;
+  opacity: 0.58;
+}
+
+.oxalis-mark__shine {
+  stroke: white;
+  stroke-width: 1.35px;
+  opacity: 0.42;
+}
+
+.oxalis-mark__node-ring {
+  fill: var(--oxalis-outline);
+  stroke: color-mix(in srgb, var(--oxalis-vein) 70%, white);
+  stroke-width: 1.15px;
+}
+
+.oxalis-mark__node {
+  fill: var(--oxalis-status-offline);
+  transition: fill 280ms ease;
+}
+
+.oxalis-mark__node-shine {
+  fill: white;
+  opacity: 0.68;
+}
+
+.oxalis-mark[data-state="offline"] {
+  opacity: 0.8;
+  filter: drop-shadow(0 2px 2px color-mix(in srgb, var(--oxalis-outline) 30%, transparent)) saturate(0.58);
+}
+
+.oxalis-mark[data-state="connecting"] .oxalis-mark__node {
+  fill: var(--oxalis-status-connecting);
+}
+
+.oxalis-mark[data-state="connecting"] .oxalis-mark__leaf-shape {
+  animation: oxalis-waiting 1.75s ease-in-out infinite;
+}
+
+.oxalis-mark[data-state="online"] {
+  filter:
+    drop-shadow(0 2px 2px color-mix(in srgb, var(--oxalis-outline) 42%, transparent))
+    drop-shadow(0 0 5px color-mix(in srgb, var(--oxalis-status-online) 35%, transparent));
+}
+
+.oxalis-mark[data-state="online"] .oxalis-mark__leaf {
+  transform: rotate(var(--open-angle));
+  animation: oxalis-leaf-open 720ms cubic-bezier(0.18, 0.88, 0.24, 1.12) var(--leaf-delay) both;
+}
+
+.oxalis-mark[data-state="online"] .oxalis-mark__leaf-shape {
+  transform: scaleX(1) scaleY(1);
+  animation: oxalis-shape-open 720ms cubic-bezier(0.18, 0.88, 0.24, 1.12) var(--leaf-delay) both;
+}
+
+.oxalis-mark[data-state="online"] .oxalis-mark__node {
+  fill: var(--oxalis-status-online);
+}
+
+.oxalis-mark[data-state="online"] .oxalis-mark__node-ring {
+  animation: oxalis-node-online 900ms ease-out 180ms both;
+}
+
+@keyframes oxalis-leaf-open {
+  from {
+    transform: rotate(var(--closed-angle)) translateY(1px);
+  }
+
+  to {
+    transform: rotate(var(--open-angle));
+  }
+}
+
+@keyframes oxalis-shape-open {
+  from {
+    transform: scaleX(0.48) scaleY(0.94);
+  }
+
+  to {
+    transform: scaleX(1) scaleY(1);
+  }
+}
+
+@keyframes oxalis-waiting {
+  0%,
+  100% {
+    transform: scaleX(0.48) scaleY(0.94);
+  }
+
+  50% {
+    transform: scaleX(0.59) scaleY(0.98);
+  }
+}
+
+@keyframes oxalis-node-online {
+  0% {
+    opacity: 0.55;
+    transform: scale(0.72);
+    transform-origin: 36px 39px;
+  }
+
+  62% {
+    opacity: 1;
+    transform: scale(1.18);
+    transform-origin: 36px 39px;
+  }
+
+  100% {
+    opacity: 1;
+    transform: scale(1);
+    transform-origin: 36px 39px;
+  }
 }
 
 .top-actions {
@@ -401,6 +625,25 @@ button {
 
 .chat-language-picker {
   display: none;
+}
+
+.chat-title-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.chat-sound-trigger {
+  width: 31px;
+  height: 28px;
+  border-color: color-mix(in srgb, var(--line-dark) 75%, transparent);
+  box-shadow: inset 1px 1px 0 #fff9;
+}
+
+.chat-sound-trigger svg {
+  width: 16px;
+  height: 16px;
 }
 
 .privacy-note {
@@ -499,6 +742,17 @@ button {
   background: var(--accent-pale);
 }
 
+.sound-menu-button {
+  margin-top: 4px;
+  border-top: 1px solid var(--line-soft) !important;
+}
+
+.sound-menu-button svg {
+  width: 18px;
+  height: 18px;
+  color: var(--accent-strong);
+}
+
 .theme-preview {
   width: 29px;
   height: 17px;
@@ -516,6 +770,42 @@ button {
   margin-left: auto;
   color: var(--accent-strong);
   font-weight: 800;
+}
+
+.sound-trigger {
+  width: 34px;
+  height: 32px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  padding: 0;
+  color: var(--accent-strong);
+  background: linear-gradient(#ffffffb8, var(--panel));
+  border: 1px solid var(--line-dark);
+  border-radius: 5px;
+  box-shadow: inset 1px 1px 0 #fff9, 0 1px 2px var(--shadow);
+  cursor: pointer;
+}
+
+.sound-trigger svg {
+  width: 18px;
+  height: 18px;
+}
+
+.sound-trigger.muted {
+  color: var(--muted);
+  opacity: 0.78;
+}
+
+.sound-trigger:hover,
+.sound-trigger:focus-visible {
+  color: var(--button-text);
+  background: linear-gradient(var(--button-top), var(--button-bottom));
+  outline: 0;
+}
+
+.chat-open .top-sound-trigger {
+  display: none;
 }
 
 .card {
@@ -637,6 +927,11 @@ button {
   width: 26px;
   height: 26px;
   margin: -4px -3px;
+}
+
+.welcome-mark.offline {
+  color: var(--muted);
+  background: color-mix(in srgb, var(--panel) 78%, var(--paper));
 }
 
 .eyebrow {
@@ -2086,6 +2381,13 @@ textarea:focus {
     animation: none;
   }
 
+  .oxalis-mark__leaf,
+  .oxalis-mark__leaf-shape,
+  .oxalis-mark__node-ring {
+    animation: none !important;
+    transition: none !important;
+  }
+
   @keyframes splash-screen-reduced {
     0%,
     72% {
@@ -2180,8 +2482,13 @@ textarea:focus {
     padding-right: 13px;
   }
 
-  .chat-language-picker + .window-controls {
+  .chat-title-actions + .window-controls {
     margin-left: 0;
+  }
+
+  .chat-sound-trigger {
+    width: 40px;
+    height: 40px;
   }
 
   .page-footer {
@@ -2264,7 +2571,7 @@ textarea:focus {
     flex: 1 1 0;
   }
 
-  .chat-card > .window-titlebar > .chat-language-picker,
+  .chat-card > .window-titlebar > .chat-title-actions,
   .chat-card > .window-titlebar > .window-controls {
     flex: 0 0 auto;
   }
@@ -2459,7 +2766,8 @@ textarea:focus {
     padding-left: 1px;
   }
 
-  .chat-language-picker {
+  .chat-language-picker,
+  .top-sound-trigger {
     display: none;
   }
 

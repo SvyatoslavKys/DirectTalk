@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 72 72">
+  <defs>
+    <linearGradient id="a" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#dc5d9d"/><stop offset=".52" stop-color="#8e2e6d"/><stop offset="1" stop-color="#3c1435"/>
+    </linearGradient>
+    <linearGradient id="b" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#c84f91"/><stop offset=".55" stop-color="#76275f"/><stop offset="1" stop-color="#32122e"/>
+    </linearGradient>
+    <linearGradient id="c" x1="0" y1="0" x2="1" y2="1">
+      <stop stop-color="#ec70ad"/><stop offset=".55" stop-color="#a43a7b"/><stop offset="1" stop-color="#48153e"/>
+    </linearGradient>
+    <path id="leaf" d="M36 38 11.5 15.7C17.8 9.2 25.2 7.1 31.8 9.8c2.1.9 3.4 2.2 4.2 3.6.8-1.4 2.1-2.7 4.2-3.6 6.6-2.7 14-.6 20.3 5.9Z"/>
+  </defs>
+  <path d="M36 66c-2.2-11-1.6-19 0-27" fill="none" stroke="#88a653" stroke-width="3" stroke-linecap="round"/>
+  <g stroke="#461533" stroke-width="1.2" stroke-linejoin="round">
+    <use href="#leaf" fill="url(#a)"/>
+    <use href="#leaf" fill="url(#b)" transform="rotate(-118 36 39)"/>
+    <use href="#leaf" fill="url(#c)" transform="rotate(118 36 39)"/>
+  </g>
+  <g fill="none" stroke="#f4b3d2" stroke-width="1.1" stroke-linecap="round" opacity=".6">
+    <path d="M36 37.5c-.3-8.2-.2-16.9 0-23.7"/>
+    <path d="M36 37.5c-.3-8.2-.2-16.9 0-23.7" transform="rotate(-118 36 39)"/>
+    <path d="M36 37.5c-.3-8.2-.2-16.9 0-23.7" transform="rotate(118 36 39)"/>
+  </g>
+  <circle cx="36" cy="39" r="5" fill="#421437" stroke="#f3c9df" stroke-width="1.2"/>
+  <circle cx="36" cy="39" r="3.1" fill="#75bd43"/>
+</svg>

@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode } from "react";
 import QRCode from "qrcode";
-import oxalisLogo from "./assets/directtalk-oxalis.png";
+import { OxalisMark, type OxalisState } from "./components/OxalisMark";
 import {
   DirectTalkConnection,
   type AppPayload,
@@ -58,6 +58,7 @@ import {
   subscribeDiagnostics,
 } from "./lib/diagnostics";
 import { APP_VERSION } from "./lib/version";
+import { appSounds, readSoundEnabled, writeSoundEnabled } from "./lib/sounds";
 
 type Screen = "loading" | "home" | "waiting" | "chat" | "error";
 type ThemeId = "lime" | "aqua" | "midnight";
@@ -160,6 +161,7 @@ export default function App() {
   const [showDiagnostics, setShowDiagnostics] = useState(false);
   const [errorDiagnosticId, setErrorDiagnosticId] = useState<number | null>(null);
   const [theme, setTheme] = useState<ThemeId>(() => readTheme());
+  const [soundsEnabled, setSoundsEnabled] = useState(() => readSoundEnabled());
   const [showSplash, setShowSplash] = useState(true);
   const connectionRef = useRef<DirectTalkConnection | null>(null);
   const peerRef = useRef<SecurePeer | null>(null);
@@ -179,6 +181,7 @@ export default function App() {
   const pendingClearRequestRef = useRef<string | null>(null);
   const pendingClearTimerRef = useRef<number | null>(null);
   const chatGenerationRef = useRef(0);
+  const previousScreenRef = useRef<Screen>("loading");
 
   const invalidInvite = useMemo(
     () => window.location.hash.startsWith("#invite=") && !incomingInvite,
@@ -220,6 +223,42 @@ export default function App() {
     const timer = window.setTimeout(() => setShowSplash(false), reduceMotion ? 650 : 2_400);
     return () => window.clearTimeout(timer);
   }, []);
+
+  useEffect(() => {
+    appSounds.setEnabled(soundsEnabled);
+    writeSoundEnabled(soundsEnabled);
+  }, [soundsEnabled]);
+
+  useEffect(() => {
+    if (!soundsEnabled) return;
+    let listening = true;
+    const removeUnlockListeners = () => {
+      if (!listening) return;
+      listening = false;
+      window.removeEventListener("pointerdown", unlockSound, true);
+      window.removeEventListener("keydown", unlockSound, true);
+    };
+    const tryStartupSound = () => {
+      void appSounds.play("startup").then((played) => {
+        if (played) removeUnlockListeners();
+      });
+    };
+    function unlockSound() {
+      tryStartupSound();
+    }
+
+    window.addEventListener("pointerdown", unlockSound, { capture: true });
+    window.addEventListener("keydown", unlockSound, { capture: true });
+    tryStartupSound();
+    return removeUnlockListeners;
+  }, [soundsEnabled]);
+
+  useEffect(() => {
+    const previous = previousScreenRef.current;
+    if (screen === "chat" && previous !== "chat") void appSounds.play("connect");
+    if (previous === "chat" && screen !== "chat") void appSounds.play("disconnect");
+    previousScreenRef.current = screen;
+  }, [screen]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -1128,6 +1167,14 @@ export default function App() {
     }
   }
 
+  function toggleSounds() {
+    const next = !soundsEnabled;
+    appSounds.setEnabled(next);
+    writeSoundEnabled(next);
+    setSoundsEnabled(next);
+    if (next) void appSounds.play("startup");
+  }
+
   function reset() {
     logDiagnostic("app", "returned-home");
     chatGenerationRef.current += 1;
@@ -1175,6 +1222,11 @@ export default function App() {
     (transfer) => transfer.direction === "incoming" && transfer.status !== "complete",
   );
   const isConversationOpen = screen === "chat";
+  const logoState: OxalisState = isConversationOpen
+    ? "online"
+    : screen === "loading" || screen === "waiting"
+      ? "connecting"
+      : "offline";
 
   return (
     <>
@@ -1182,7 +1234,7 @@ export default function App() {
       <main className={`app-shell ${isConversationOpen ? "chat-open" : ""}`} data-theme={theme}>
       <header className="topbar">
         <button className="brand" type="button" onClick={screen === "home" ? undefined : reset} aria-label={t("top.home")}>
-          <FlowerMark />
+          <OxalisMark state={logoState} />
           <span className="brand-copy"><strong>DirectTalk</strong><small>peer-to-peer messenger</small></span>
         </button>
         <div className="top-actions">
@@ -1235,9 +1287,20 @@ export default function App() {
                     {theme === option.id && <span className="menu-check">✓</span>}
                   </button>
                 ))}
+                <button className="sound-menu-button" type="button" onClick={toggleSounds} aria-pressed={soundsEnabled}>
+                  <SpeakerIcon muted={!soundsEnabled} />
+                  {soundsEnabled ? t("sound.on") : t("sound.off")}
+                  <span className="menu-check">{soundsEnabled ? "✓" : "—"}</span>
+                </button>
               </div>
             )}
           </div>
+          <SoundToggle
+            className="top-sound-trigger"
+            enabled={soundsEnabled}
+            onToggle={toggleSounds}
+            label={soundsEnabled ? t("sound.disable") : t("sound.enable")}
+          />
           <button
             className="diagnostics-trigger"
             type="button"
@@ -1255,9 +1318,9 @@ export default function App() {
 
       {screen === "home" && (
         <section className="card home-card y2k-window">
-          <WindowTitlebar title={incomingInvite ? t("home.incomingWindow") : t("home.newWindow")} />
+          <WindowTitlebar title={incomingInvite ? t("home.incomingWindow") : t("home.newWindow")} markState="offline" />
           <div className="home-body">
-            <div className="welcome-mark"><FlowerMark /><span>{t("peer.online")}</span></div>
+            <div className="welcome-mark offline"><OxalisMark state="offline" /><span>{t("peer.offline")}</span></div>
             <div className="eyebrow">{t("home.eyebrow")}</div>
             <h1>{incomingInvite ? t("home.invitedTitle") : t("home.greetingTitle")}</h1>
             <p className="lead">{t("home.lead")}</p>
@@ -1302,7 +1365,7 @@ export default function App() {
 
       {screen === "waiting" && invitation && (
         <section className="card waiting-card y2k-window">
-          <WindowTitlebar title={t("waiting.window")} />
+          <WindowTitlebar title={t("waiting.window")} markState="connecting" />
           <div className="waiting-body">
             <div className="pulse-lock"><LockIcon /></div>
             <div className="eyebrow">{t(stateLabelKeys[connectionState])}</div>
@@ -1335,21 +1398,30 @@ export default function App() {
             title={`${activePeer.name} — ${t("chat.title")}`}
             onClose={reset}
             closeLabel={t("common.close")}
+            markState="online"
             extra={(
-              <label className="language-picker chat-language-picker">
-                <select
-                  value={languagePreference}
-                  onChange={(event) => setLanguagePreference(event.target.value as LanguagePreference)}
-                  aria-label={t("language.label")}
-                  title={t("language.label")}
-                >
-                  <option value="auto">{t("language.auto")} · {language.toUpperCase()}</option>
-                  <option value="en">EN</option>
-                  <option value="pl">PL</option>
-                  <option value="ru">RU</option>
-                  <option value="uk">UK</option>
-                </select>
-              </label>
+              <div className="chat-title-actions">
+                <SoundToggle
+                  className="chat-sound-trigger"
+                  enabled={soundsEnabled}
+                  onToggle={toggleSounds}
+                  label={soundsEnabled ? t("sound.disable") : t("sound.enable")}
+                />
+                <label className="language-picker chat-language-picker">
+                  <select
+                    value={languagePreference}
+                    onChange={(event) => setLanguagePreference(event.target.value as LanguagePreference)}
+                    aria-label={t("language.label")}
+                    title={t("language.label")}
+                  >
+                    <option value="auto">{t("language.auto")} · {language.toUpperCase()}</option>
+                    <option value="en">EN</option>
+                    <option value="pl">PL</option>
+                    <option value="ru">RU</option>
+                    <option value="uk">UK</option>
+                  </select>
+                </label>
+              </div>
             )}
           />
           <input
@@ -1424,7 +1496,7 @@ export default function App() {
                 ))}
                 {activeMessages.length === 0 && incomingPhotoOffers.length === 0 && incomingTransfers.length === 0 && (
                   <div className="empty-chat">
-                    <FlowerMark />
+                    <OxalisMark state="online" />
                     <strong>{t("empty.online", { name: activePeer.name })}</strong>
                     <span>{t("empty.prompt")}</span>
                   </div>
@@ -1521,7 +1593,7 @@ export default function App() {
 
             <aside className="peer-sidebar">
               <div className="peer-avatar" aria-hidden="true">{activePeer.name.slice(0, 1).toUpperCase()}</div>
-              <div className="peer-online"><FlowerMark /><strong>{activePeer.name}</strong></div>
+              <div className="peer-online"><OxalisMark state="online" /><strong>{activePeer.name}</strong></div>
               <span className="presence">● {t("peer.online")}</span>
               <div className="peer-divider" />
               <button type="button" className={activeContact.verified ? "verified" : ""} onClick={() => setShowSecurity(!showSecurity)}>
@@ -1535,7 +1607,7 @@ export default function App() {
           {deleteConfirmation && (
             <div className="dialog-backdrop" role="presentation">
               <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title">
-                <WindowTitlebar title={t("delete.window")} onClose={() => setDeleteConfirmation(null)} closeLabel={t("common.close")} />
+                <WindowTitlebar title={t("delete.window")} onClose={() => setDeleteConfirmation(null)} closeLabel={t("common.close")} markState="online" />
                 <div className="confirm-dialog-body">
                   <div className="confirm-dialog-icon">!</div>
                   <div>
@@ -1556,7 +1628,7 @@ export default function App() {
           {showClearDialog && (
             <div className="dialog-backdrop" role="presentation">
               <section className="confirm-dialog clear-dialog" role="dialog" aria-modal="true" aria-labelledby="clear-dialog-title">
-                <WindowTitlebar title={t("clear.window")} onClose={() => setShowClearDialog(false)} closeLabel={t("common.close")} />
+                <WindowTitlebar title={t("clear.window")} onClose={() => setShowClearDialog(false)} closeLabel={t("common.close")} markState="online" />
                 <div className="confirm-dialog-body">
                   <div className="confirm-dialog-icon">!</div>
                   <div>
@@ -1579,7 +1651,7 @@ export default function App() {
 
       {screen === "error" && (
         <section className="card error-card y2k-window">
-          <WindowTitlebar title={t("error.window")} />
+          <WindowTitlebar title={t("error.window")} markState="offline" />
           <div className="error-body">
             <div className="error-icon">!</div>
             <h1>{t("error.title")}</h1>
@@ -1591,7 +1663,7 @@ export default function App() {
         </section>
       )}
 
-        {showDiagnostics && <DiagnosticsPanel language={language} onClose={() => setShowDiagnostics(false)} />}
+        {showDiagnostics && <DiagnosticsPanel language={language} markState={logoState} onClose={() => setShowDiagnostics(false)} />}
 
         <footer className="page-footer"><span>DirectTalk {APP_VERSION}</span><span>{t("footer.history")}</span></footer>
       </main>
@@ -1603,13 +1675,21 @@ function SplashScreen() {
   return (
     <div className="splash-screen" aria-hidden="true">
       <div className="splash-glow" />
-      <img className="splash-logo" src={oxalisLogo} alt="" draggable="false" />
+      <OxalisMark className="splash-logo" state="connecting" />
       <span className="splash-name">DirectTalk</span>
     </div>
   );
 }
 
-function DiagnosticsPanel({ language, onClose }: { language: Language; onClose: () => void }) {
+function DiagnosticsPanel({
+  language,
+  markState,
+  onClose,
+}: {
+  language: Language;
+  markState: OxalisState;
+  onClose: () => void;
+}) {
   const copy = diagnosticsCopy[language];
   const [, setRevision] = useState(0);
   const [copied, setCopied] = useState(false);
@@ -1672,7 +1752,7 @@ function DiagnosticsPanel({ language, onClose }: { language: Language; onClose: 
       if (event.target === event.currentTarget) onClose();
     }}>
       <section className="diagnostics-panel y2k-window" role="dialog" aria-modal="true" aria-labelledby="diagnostics-title">
-        <WindowTitlebar title={copy.title} onClose={onClose} closeLabel={copy.close} />
+        <WindowTitlebar title={copy.title} onClose={onClose} closeLabel={copy.close} markState={markState} />
         <div className="diagnostics-body">
           <div className="diagnostics-heading">
             <div><h2 id="diagnostics-title">{copy.title}</h2><p>{copy.description}</p></div>
@@ -1738,7 +1818,7 @@ function PhotoMessage({
 function StatusCard({ windowTitle, title, description }: { windowTitle: string; title: string; description: string }) {
   return (
     <section className="card status-card y2k-window">
-      <WindowTitlebar title={windowTitle} />
+      <WindowTitlebar title={windowTitle} markState="connecting" />
       <div className="status-body">
         <div className="spinner" />
         <h1>{title}</h1>
@@ -1753,15 +1833,17 @@ function WindowTitlebar({
   onClose,
   closeLabel = "Close",
   extra,
+  markState = "offline",
 }: {
   title: string;
   onClose?: () => void;
   closeLabel?: string;
   extra?: ReactNode;
+  markState?: OxalisState;
 }) {
   return (
     <header className="window-titlebar">
-      <FlowerMark />
+      <OxalisMark state={markState} />
       <strong>{title}</strong>
       {extra}
       <div className="window-controls" aria-hidden={!onClose}>
@@ -1773,11 +1855,38 @@ function WindowTitlebar({
   );
 }
 
-function FlowerMark() {
+function SoundToggle({
+  enabled,
+  onToggle,
+  label,
+  className = "",
+}: {
+  enabled: boolean;
+  onToggle: () => void;
+  label: string;
+  className?: string;
+}) {
   return (
-    <span className="flower-mark" aria-hidden="true">
-      <img src={oxalisLogo} alt="" draggable="false" />
-    </span>
+    <button
+      className={`sound-trigger ${enabled ? "enabled" : "muted"} ${className}`.trim()}
+      type="button"
+      onClick={onToggle}
+      aria-label={label}
+      aria-pressed={enabled}
+      title={label}
+    >
+      <SpeakerIcon muted={!enabled} />
+    </button>
+  );
+}
+
+function SpeakerIcon({ muted }: { muted: boolean }) {
+  return (
+    <svg viewBox="0 0 24 24" aria-hidden="true">
+      <path d="M4 9h4l5-4v14l-5-4H4z" fill="currentColor" />
+      {!muted && <path d="M16 8.2c1 .9 1.5 2.2 1.5 3.8S17 14.9 16 15.8m2.6-10.2c1.7 1.6 2.7 3.7 2.7 6.4s-1 4.8-2.7 6.4" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" />}
+      {muted && <path d="m16.2 8 5.2 8m0-8-5.2 8" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" />}
+    </svg>
   );
 }
 
