@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useRef, useState, type ChangeEvent, type FormEvent, type ReactNode } from "react";
 import QRCode from "qrcode";
 import { OxalisMark, type OxalisState } from "./components/OxalisMark";
+import { ChatListCard, type ChatListCopy } from "./components/ChatListCard";
 import {
   DirectTalkConnection,
   type AppPayload,
@@ -12,9 +13,12 @@ import {
 import {
   db,
   getOrCreateIdentity,
+  hideChatLocally,
   loadAttachments,
+  loadChatSummaries,
   loadMessages,
   type StoredAttachment,
+  type StoredChatSummary,
   type StoredContact,
   type StoredMessage,
 } from "./lib/database";
@@ -60,13 +64,14 @@ import {
 import { APP_VERSION } from "./lib/version";
 import { appSounds, readSoundEnabled, writeSoundEnabled } from "./lib/sounds";
 import {
+  clearResumableIntent,
   clearResumableSession,
   readResumableSession,
   updateResumablePeerIdentity,
   writeResumableSession,
 } from "./lib/sessionResume";
 
-type Screen = "loading" | "home" | "waiting" | "chat" | "error";
+type Screen = "loading" | "chats" | "home" | "waiting" | "chat" | "error";
 type ThemeId = "lime" | "aqua" | "midnight";
 type PhotoTransferStatus = "preparing" | "waiting" | "transferring" | "receiving" | "complete" | "declined" | "cancelled" | "failed";
 type DeleteScope = "local" | "everyone";
@@ -82,6 +87,42 @@ const THEME_COLORS: Record<ThemeId, string> = {
 interface DeleteConfirmation {
   messageId: string;
   scope: DeleteScope;
+}
+
+interface ClearChatOperation {
+  id: string;
+  removeConversation: boolean;
+}
+
+interface PendingConversationRemoval {
+  chatId: string | null;
+  requestId: string;
+}
+
+interface ChatHubCopy extends ChatListCopy {
+  window: string;
+  localOnly: string;
+  listStatus: string;
+  deleteWindow: string;
+  deleteTitle: string;
+  deleteDescription: string;
+  deleteLocal: string;
+  deleteLocalDescription: string;
+  deleteBoth: string;
+  deleteBothDescription: string;
+  deletedLocal: string;
+  deletedBoth: string;
+  deletedBothLegacy: string;
+  deletedHereOnly: string;
+  deleteFailed: string;
+  reconnectDeleteNotice: string;
+  waitingRemovalAck: string;
+  incomingDeleteTitle: string;
+  incomingDeleteDescription: string;
+  offlineTitle: string;
+  offlineDescription: string;
+  offlineSecurity: string;
+  offlinePresence: string;
 }
 
 interface PhotoTransfer {
@@ -113,6 +154,81 @@ const classicEmoji = [
   "👍", "👎", "👏", "🙏", "💚", "💔", "🔥", "✨",
   "🎉", "🌼", "☕", "🍺", "🚀", "💾", "☎️", "👋",
 ];
+
+const chatHubCopy: Record<Language, ChatHubCopy> = {
+  en: {
+    window: "DirectTalk — chats", heading: "Your chats", newChat: "+ New chat",
+    emptyTitle: "No saved chats yet", emptyDescription: "Create a private chat, then it will appear here on this device.",
+    verified: "Verified device", photo: "Photo", noMessages: "No messages yet", messages: "messages", unread: "unread",
+    open: "Open history", reconnect: "Reconnect", delete: "Delete", localOnly: "Stored only on this device", listStatus: "local chat list",
+    deleteWindow: "DirectTalk — delete chat", deleteTitle: "Delete this chat?", deleteDescription: "Choose where to request deletion. This action cannot be undone.",
+    deleteLocal: "Delete on this device", deleteLocalDescription: "Messages and photos disappear here; the verified device identity is kept.",
+    deleteBoth: "Request deletion from both", deleteBothDescription: "Create a fresh secure link. After the other device connects, its owner must confirm.",
+    deletedLocal: "The chat was deleted from this device.", deletedBoth: "Both participants confirmed deletion of the chat.",
+    deletedBothLegacy: "Both histories were cleared. The other device uses an older version, so an empty chat entry may remain there.", deleteFailed: "Could not delete the saved chat.",
+    deletedHereOnly: "The chat was deleted here, but the other device did not send final confirmation.",
+    reconnectDeleteNotice: "Share the new one-time link. The deletion request will be sent after the same device connects.",
+    waitingRemovalAck: "Deleted on this device. Waiting for the other device to confirm completion…",
+    incomingDeleteTitle: "{name} asks to delete this chat on both devices",
+    incomingDeleteDescription: "Messages, photos and this chat entry will be deleted from this browser. The trusted device identity will remain.",
+    offlineTitle: "Local history", offlineDescription: "This device is not connected. Reconnect with a fresh one-time link to continue.",
+    offlineSecurity: "The session code is available only during a live secure connection.", offlinePresence: "Offline · local history",
+  },
+  pl: {
+    window: "DirectTalk — czaty", heading: "Twoje czaty", newChat: "+ Nowy czat",
+    emptyTitle: "Brak zapisanych czatów", emptyDescription: "Utwórz prywatny czat, a pojawi się tutaj na tym urządzeniu.",
+    verified: "Zweryfikowane urządzenie", photo: "Zdjęcie", noMessages: "Brak wiadomości", messages: "wiad.", unread: "nieprzeczytane",
+    open: "Otwórz historię", reconnect: "Połącz ponownie", delete: "Usuń", localOnly: "Tylko na tym urządzeniu", listStatus: "lokalna lista czatów",
+    deleteWindow: "DirectTalk — usuń czat", deleteTitle: "Usunąć ten czat?", deleteDescription: "Wybierz zakres żądania. Tej operacji nie można cofnąć.",
+    deleteLocal: "Usuń na tym urządzeniu", deleteLocalDescription: "Wiadomości i zdjęcia znikną tutaj; tożsamość zaufanego urządzenia zostanie zachowana.",
+    deleteBoth: "Poproś o usunięcie u obu", deleteBothDescription: "Utwórz nowy bezpieczny link. Po połączeniu właściciel drugiego urządzenia musi potwierdzić.",
+    deletedLocal: "Czat usunięto z tego urządzenia.", deletedBoth: "Obie osoby potwierdziły usunięcie czatu.",
+    deletedBothLegacy: "Obie historie wyczyszczono. Drugie urządzenie ma starszą wersję, więc może pozostać tam pusty wpis czatu.", deleteFailed: "Nie udało się usunąć zapisanego czatu.",
+    deletedHereOnly: "Czat usunięto tutaj, ale drugie urządzenie nie wysłało końcowego potwierdzenia.",
+    reconnectDeleteNotice: "Udostępnij nowy jednorazowy link. Żądanie usunięcia zostanie wysłane po połączeniu tego samego urządzenia.",
+    waitingRemovalAck: "Usunięto na tym urządzeniu. Czekamy na końcowe potwierdzenie drugiego urządzenia…",
+    incomingDeleteTitle: "{name} prosi o usunięcie czatu na obu urządzeniach",
+    incomingDeleteDescription: "Wiadomości, zdjęcia i wpis czatu zostaną usunięte z tej przeglądarki. Tożsamość zaufanego urządzenia pozostanie.",
+    offlineTitle: "Historia lokalna", offlineDescription: "Urządzenie nie jest połączone. Połącz je ponownie świeżym linkiem jednorazowym.",
+    offlineSecurity: "Kod sesji jest dostępny tylko podczas aktywnego bezpiecznego połączenia.", offlinePresence: "Offline · historia lokalna",
+  },
+  ru: {
+    window: "DirectTalk — чаты", heading: "Ваши чаты", newChat: "+ Новый чат",
+    emptyTitle: "Сохранённых чатов пока нет", emptyDescription: "Создайте приватный чат — он появится здесь на этом устройстве.",
+    verified: "Проверенное устройство", photo: "Фотография", noMessages: "Сообщений пока нет", messages: "сообщ.", unread: "непрочитанных",
+    open: "Открыть историю", reconnect: "Подключиться", delete: "Удалить", localOnly: "Только на этом устройстве", listStatus: "локальный список чатов",
+    deleteWindow: "DirectTalk — удаление чата", deleteTitle: "Удалить этот чат?", deleteDescription: "Выберите, где запросить удаление. Отменить действие нельзя.",
+    deleteLocal: "Удалить на этом устройстве", deleteLocalDescription: "Сообщения и фото исчезнут здесь, но ключ проверенного устройства сохранится.",
+    deleteBoth: "Запросить удаление у обоих", deleteBothDescription: "Будет создана новая защищённая ссылка. После подключения владелец второго устройства должен подтвердить запрос.",
+    deletedLocal: "Чат удалён с этого устройства.", deletedBoth: "Оба участника подтвердили удаление чата.",
+    deletedBothLegacy: "История очищена у обоих. На втором устройстве старая версия, поэтому там может остаться пустая строка чата.", deleteFailed: "Не удалось удалить сохранённый чат.",
+    deletedHereOnly: "Чат удалён здесь, но второе устройство не прислало финальное подтверждение.",
+    reconnectDeleteNotice: "Передайте новую одноразовую ссылку. Запрос удаления уйдёт после подключения того же устройства.",
+    waitingRemovalAck: "На этом устройстве чат удалён. Ждём финальное подтверждение второго устройства…",
+    incomingDeleteTitle: "{name} просит удалить чат на обоих устройствах",
+    incomingDeleteDescription: "Сообщения, фото и чат будут удалены из этого браузера. Ключ доверенного устройства сохранится.",
+    offlineTitle: "Локальная история", offlineDescription: "Сейчас соединения нет. Создайте новую одноразовую ссылку, чтобы продолжить чат.",
+    offlineSecurity: "Код сеанса доступен только во время активного защищённого соединения.", offlinePresence: "Офлайн · локальная история",
+  },
+  uk: {
+    window: "DirectTalk — чати", heading: "Ваші чати", newChat: "+ Новий чат",
+    emptyTitle: "Збережених чатів поки немає", emptyDescription: "Створіть приватний чат — він з’явиться тут на цьому пристрої.",
+    verified: "Перевірений пристрій", photo: "Фотографія", noMessages: "Повідомлень поки немає", messages: "повід.", unread: "непрочитаних",
+    open: "Відкрити історію", reconnect: "Підключитися", delete: "Видалити", localOnly: "Лише на цьому пристрої", listStatus: "локальний список чатів",
+    deleteWindow: "DirectTalk — видалення чату", deleteTitle: "Видалити цей чат?", deleteDescription: "Оберіть, де запросити видалення. Цю дію не можна скасувати.",
+    deleteLocal: "Видалити на цьому пристрої", deleteLocalDescription: "Повідомлення й фото зникнуть тут, але ключ перевіреного пристрою збережеться.",
+    deleteBoth: "Запросити видалення в обох", deleteBothDescription: "Буде створено нове захищене посилання. Після підключення власник іншого пристрою має підтвердити.",
+    deletedLocal: "Чат видалено з цього пристрою.", deletedBoth: "Обидва учасники підтвердили видалення чату.",
+    deletedBothLegacy: "Історію очищено в обох. На іншому пристрої стара версія, тому там може лишитися порожній запис чату.", deleteFailed: "Не вдалося видалити збережений чат.",
+    deletedHereOnly: "Чат видалено тут, але інший пристрій не надіслав фінального підтвердження.",
+    reconnectDeleteNotice: "Передайте нове одноразове посилання. Запит на видалення надійде після підключення того самого пристрою.",
+    waitingRemovalAck: "На цьому пристрої чат видалено. Чекаємо фінального підтвердження іншого пристрою…",
+    incomingDeleteTitle: "{name} просить видалити чат на обох пристроях",
+    incomingDeleteDescription: "Повідомлення, фото й чат буде видалено з цього браузера. Ключ довіреного пристрою збережеться.",
+    offlineTitle: "Локальна історія", offlineDescription: "З’єднання немає. Створіть нове одноразове посилання, щоб продовжити чат.",
+    offlineSecurity: "Код сеансу доступний лише під час активного захищеного з’єднання.", offlinePresence: "Офлайн · локальна історія",
+  },
+};
 
 const stateLabelKeys: Record<ConnectionState, TranslationKey> = {
   "connecting-signaling": "state.connectingSignaling",
@@ -156,6 +272,10 @@ export default function App() {
   const [connectionState, setConnectionState] = useState<ConnectionState>("connecting-signaling");
   const [peer, setPeer] = useState<SecurePeer | null>(null);
   const [contact, setContact] = useState<StoredContact | null>(null);
+  const [chatSummaries, setChatSummaries] = useState<StoredChatSummary[]>([]);
+  const [chatListBusyId, setChatListBusyId] = useState<string | null>(null);
+  const [chatListNotice, setChatListNotice] = useState("");
+  const [chatDeleteTarget, setChatDeleteTarget] = useState<StoredChatSummary | null>(null);
   const [messages, setMessages] = useState<StoredMessage[]>([]);
   const [attachments, setAttachments] = useState<Record<string, StoredAttachment>>({});
   const [incomingPhotoOffers, setIncomingPhotoOffers] = useState<PhotoOfferPayload[]>([]);
@@ -165,8 +285,9 @@ export default function App() {
   const [deleteConfirmation, setDeleteConfirmation] = useState<DeleteConfirmation | null>(null);
   const [pendingDeleteIds, setPendingDeleteIds] = useState<Set<string>>(() => new Set());
   const [showClearDialog, setShowClearDialog] = useState(false);
-  const [incomingClearRequest, setIncomingClearRequest] = useState<string | null>(null);
-  const [pendingClearRequest, setPendingClearRequest] = useState<string | null>(null);
+  const [incomingClearRequest, setIncomingClearRequest] = useState<ClearChatOperation | null>(null);
+  const [pendingClearRequest, setPendingClearRequest] = useState<ClearChatOperation | null>(null);
+  const [awaitingRemovalAck, setAwaitingRemovalAck] = useState(false);
   const [historyNotice, setHistoryNotice] = useState("");
   const [draft, setDraft] = useState("");
   const [error, setError] = useState("");
@@ -194,12 +315,16 @@ export default function App() {
   const pendingDeleteIdsRef = useRef(new Set<string>());
   const pendingDeleteTimersRef = useRef(new Map<string, number>());
   const pendingDeliveryTimersRef = useRef(new Map<string, number>());
-  const incomingClearRequestRef = useRef<string | null>(null);
-  const pendingClearRequestRef = useRef<string | null>(null);
+  const incomingClearRequestRef = useRef<ClearChatOperation | null>(null);
+  const pendingClearRequestRef = useRef<ClearChatOperation | null>(null);
   const pendingClearTimerRef = useRef<number | null>(null);
+  const pendingConversationRemovalRef = useRef<PendingConversationRemoval | null>(null);
+  const awaitingIncomingRemovalAckRef = useRef<ClearChatOperation | null>(null);
+  const incomingRemovalAckTimerRef = useRef<number | null>(null);
   const connectionGenerationRef = useRef(0);
   const chatGenerationRef = useRef(0);
-  const previousScreenRef = useRef<Screen>("loading");
+  const chatListOperationRef = useRef(0);
+  const previousSecureRef = useRef(false);
   const startupSoundAtRef = useRef(Number.NEGATIVE_INFINITY);
 
   const invalidInvite = useMemo(
@@ -255,16 +380,26 @@ export default function App() {
           if (resumableSession.role === "creator" && resumableSession.invitation.creatorIdentity !== keys.publicKeyRaw) {
             clearResumableSession();
             setResumableSession(null);
-            setScreen("home");
+            setScreen("chats");
             return;
           }
           setDisplayName(resumableSession.displayName);
           setInvitation(resumableSession.invitation);
-          if (resumableSession.role === "creator" && !resumableSession.expectedPeerIdentity) {
+          if (
+            resumableSession.role === "creator" &&
+            (!resumableSession.expectedPeerIdentity || resumableSession.sharePending)
+          ) {
             setInviteLink(invitationUrl(resumableSession.invitation));
           }
           setConnectionState("reconnecting");
           setScreen("waiting");
+          pendingConversationRemovalRef.current =
+            resumableSession.intent === "remove-conversation" && resumableSession.intentId
+              ? { chatId: null, requestId: resumableSession.intentId }
+              : null;
+          if (resumableSession.intent === "remove-conversation") {
+            setChatListNotice(chatHubCopy[language].reconnectDeleteNotice);
+          }
           logDiagnostic("app", "session-resume-started", { role: resumableSession.role });
           startConnection(resumableSession.invitation, resumableSession.role, keys, {
             resume: true,
@@ -272,7 +407,7 @@ export default function App() {
             displayName: resumableSession.displayName,
           });
         } else {
-          setScreen("home");
+          setScreen(incomingInvite ? "home" : "chats");
         }
       })
       .catch((reason: unknown) => {
@@ -284,11 +419,17 @@ export default function App() {
     };
   }, [invalidInvite]);
 
+  useEffect(() => {
+    if (screen !== "chats") return;
+    void refreshChatSummaries();
+  }, [screen]);
+
   useEffect(() => () => {
     connectionRef.current?.close();
     for (const timer of pendingDeleteTimersRef.current.values()) window.clearTimeout(timer);
     for (const timer of pendingDeliveryTimersRef.current.values()) window.clearTimeout(timer);
     if (pendingClearTimerRef.current !== null) window.clearTimeout(pendingClearTimerRef.current);
+    if (incomingRemovalAckTimerRef.current !== null) window.clearTimeout(incomingRemovalAckTimerRef.current);
   }, []);
 
   useEffect(() => {
@@ -344,13 +485,12 @@ export default function App() {
   }, [soundsEnabled]);
 
   useEffect(() => {
-    const previous = previousScreenRef.current;
-    previousScreenRef.current = screen;
-    if (showSplash) {
-      return;
-    }
+    if (showSplash) return;
+    const wasSecure = previousSecureRef.current;
+    const isSecure = connectionState === "secure";
+    previousSecureRef.current = isSecure;
     let connectTimer: number | null = null;
-    if (screen === "chat" && previous !== "chat") {
+    if (isSecure && !wasSecure) {
       const startupElapsed = performance.now() - startupSoundAtRef.current;
       const delay = Math.max(0, 720 - startupElapsed);
       if (delay > 0) {
@@ -359,11 +499,11 @@ export default function App() {
         void appSounds.play("connect");
       }
     }
-    if (previous === "chat" && screen !== "chat") void appSounds.play("disconnect");
+    if (wasSecure && !isSecure) void appSounds.play("disconnect");
     return () => {
       if (connectTimer !== null) window.clearTimeout(connectTimer);
     };
-  }, [screen, showSplash]);
+  }, [connectionState, showSplash]);
 
   useEffect(() => {
     document.documentElement.dataset.theme = theme;
@@ -403,20 +543,158 @@ export default function App() {
 
   useEffect(() => {
     const markVisibleMessagesRead = () => {
-      if (document.visibilityState !== "visible" || !peerRef.current || !connectionRef.current) return;
+      if (document.visibilityState !== "visible" || screen !== "chat" || !peerRef.current || !connectionRef.current) return;
+      const connection = connectionRef.current;
       const unread = messages.filter((message) => message.sender === "peer" && message.status === "delivered");
       for (const message of unread) {
-        void acknowledgeMessage(connectionRef.current, message.id, "read").catch(handleLocalError);
-        void db.messages.update(message.id, { status: "read" }).catch(handleLocalError);
+        void db.messages.update(message.id, { status: "read", readReceiptPending: true })
+          .then(() => acknowledgeMessage(connection, message.id, "read"))
+          .then(() => db.messages.update(message.id, { readReceiptPending: false }))
+          .catch(handleLocalError);
       }
       if (unread.length) {
         const ids = new Set(unread.map((message) => message.id));
-        setMessages((current) => current.map((message) => (ids.has(message.id) ? { ...message, status: "read" } : message)));
+        setMessages((current) => current.map((message) => (
+          ids.has(message.id) ? { ...message, status: "read", readReceiptPending: true } : message
+        )));
       }
     };
     document.addEventListener("visibilitychange", markVisibleMessagesRead);
     return () => document.removeEventListener("visibilitychange", markVisibleMessagesRead);
-  }, [messages]);
+  }, [messages, screen]);
+
+  async function refreshChatSummaries() {
+    const operation = chatListOperationRef.current;
+    try {
+      const summaries = await loadChatSummaries();
+      if (operation === chatListOperationRef.current) setChatSummaries(summaries);
+    } catch (reason) {
+      logDiagnostic("storage", "chat-list-load-failed", { reason: safeErrorText(reason) }, "error");
+      setChatListNotice(chatHubCopy[language].deleteFailed);
+    }
+  }
+
+  async function openSavedChat(summary: StoredChatSummary) {
+    const { contact: savedContact } = summary;
+    closeActiveConversation();
+    const operation = chatListOperationRef.current + 1;
+    chatListOperationRef.current = operation;
+    setChatListBusyId(savedContact.id);
+    try {
+      const [history, storedAttachments] = await Promise.all([
+        loadMessages(savedContact.id),
+        loadAttachments(savedContact.id),
+      ]);
+      if (operation !== chatListOperationRef.current) return;
+      const unreadIds = history
+        .filter((message) => message.sender === "peer" && message.status !== "read")
+        .map((message) => message.id);
+      if (unreadIds.length) {
+        await Promise.all(unreadIds.map((id) => db.messages.update(id, {
+          status: "read",
+          readReceiptPending: true,
+        })));
+      }
+      if (operation !== chatListOperationRef.current) return;
+      const localHistory = history.map((message) => (
+        unreadIds.includes(message.id)
+          ? { ...message, status: "read" as const, readReceiptPending: true }
+          : message
+      ));
+      const offlinePeer: SecurePeer = {
+        id: savedContact.id,
+        name: savedContact.name,
+        identityKey: savedContact.identityKey,
+        fingerprint: savedContact.fingerprint,
+        securityCode: "",
+      };
+      setPeer(offlinePeer);
+      setContact(savedContact);
+      setMessages(localHistory);
+      setAttachments(indexAttachments(storedAttachments));
+      setConnectionState("closed");
+      setScreen("chat");
+      logDiagnostic("storage", "local-chat-opened", { messages: localHistory.length, attachments: storedAttachments.length });
+    } catch (reason) {
+      if (operation !== chatListOperationRef.current) return;
+      logDiagnostic("storage", "local-chat-open-failed", { reason: safeErrorText(reason) }, "error");
+      setChatListNotice(chatHubCopy[language].deleteFailed);
+      setScreen("chats");
+    } finally {
+      if (operation === chatListOperationRef.current) setChatListBusyId(null);
+    }
+  }
+
+  function reconnectSavedChat(summary: StoredChatSummary, removeConversation = false) {
+    reconnectContact(summary.contact, removeConversation);
+  }
+
+  function reconnectContact(savedContact: StoredContact, removeConversation = false) {
+    if (!identity) return;
+    if (!validateName()) {
+      goToNewChat();
+      setError(t("error.name"));
+      return;
+    }
+    closeActiveConversation();
+    const nextInvitation = createInvitation(identity);
+    const link = invitationUrl(nextInvitation);
+    const normalizedName = displayName.trim().normalize("NFC");
+    const removalRequestId = removeConversation ? crypto.randomUUID() : undefined;
+    writeResumableSession({
+      invitation: nextInvitation,
+      role: "creator",
+      displayName: normalizedName,
+      expectedPeerIdentity: savedContact.identityKey,
+      sharePending: true,
+      ...(removeConversation ? { intent: "remove-conversation" as const } : {}),
+      ...(removalRequestId ? { intentId: removalRequestId } : {}),
+    });
+    pendingConversationRemovalRef.current = removalRequestId
+      ? { chatId: savedContact.id, requestId: removalRequestId }
+      : null;
+    setChatListBusyId(savedContact.id);
+    setChatListNotice(removeConversation ? chatHubCopy[language].reconnectDeleteNotice : "");
+    setInvitation(nextInvitation);
+    setInviteLink(link);
+    setConnectionState("connecting-signaling");
+    setScreen("waiting");
+    logDiagnostic("app", "known-contact-reconnect-started", { removeConversation });
+    startConnection(nextInvitation, "creator", identity, {
+      expectedPeerIdentity: savedContact.identityKey,
+      displayName: normalizedName,
+    });
+  }
+
+  async function deleteSavedChatLocally() {
+    const target = chatDeleteTarget;
+    if (!target) return;
+    setChatDeleteTarget(null);
+    const operation = chatListOperationRef.current + 1;
+    chatListOperationRef.current = operation;
+    setChatListBusyId(target.contact.id);
+    try {
+      await hideChatLocally(target.contact.id);
+      const summaries = await loadChatSummaries();
+      if (operation !== chatListOperationRef.current) return;
+      setChatSummaries(summaries);
+      setChatListNotice(chatHubCopy[language].deletedLocal);
+      logDiagnostic("storage", "saved-chat-hidden");
+    } catch (reason) {
+      if (operation !== chatListOperationRef.current) return;
+      logDiagnostic("storage", "saved-chat-hide-failed", { reason: safeErrorText(reason) }, "error");
+      setChatListNotice(chatHubCopy[language].deleteFailed);
+    } finally {
+      if (operation === chatListOperationRef.current) setChatListBusyId(null);
+    }
+  }
+
+  function deleteSavedChatForBoth() {
+    const target = chatDeleteTarget;
+    if (!target) return;
+    setChatDeleteTarget(null);
+    reconnectSavedChat(target, true);
+  }
 
   function startCreator(event: FormEvent) {
     event.preventDefault();
@@ -561,8 +839,37 @@ export default function App() {
     }
     updateResumablePeerIdentity(securePeer.identityKey);
     logDiagnostic("storage", "chat-history-loaded", { messages: history.length, attachments: storedAttachments.length });
+    setChatListBusyId(null);
     setScreen("chat");
+    const pendingRemoval = pendingConversationRemovalRef.current;
+    const removalPending = Boolean(
+      pendingRemoval && (pendingRemoval.chatId === null || pendingRemoval.chatId === securePeer.id),
+    );
+    if (removalPending && generation === connectionGenerationRef.current) {
+      pendingConversationRemovalRef.current = null;
+      await requestClearForEveryone(true, pendingRemoval?.requestId);
+      return;
+    }
+
     await resendPendingTextMessages(recoveredHistory, generation);
+    const connection = connectionRef.current;
+    if (connection && generation === connectionGenerationRef.current) {
+      const pendingReadReceipts = recoveredHistory.filter((message) => (
+        message.sender === "peer" && message.status === "read" && message.readReceiptPending
+      ));
+      for (const message of pendingReadReceipts) {
+        try {
+          await acknowledgeMessage(connection, message.id, "read");
+          await db.messages.update(message.id, { readReceiptPending: false });
+          setMessages((current) => current.map((item) => (
+            item.id === message.id ? { ...item, readReceiptPending: false } : item
+          )));
+        } catch (reason) {
+          logDiagnostic("chat", "read-receipt-requeue-failed", { reason: safeErrorText(reason) }, "warn");
+          break;
+        }
+      }
+    }
   }
 
   async function resendPendingTextMessages(history: StoredMessage[], generation: number) {
@@ -594,6 +901,15 @@ export default function App() {
   async function handlePayload(connection: DirectTalkConnection, payload: Exclude<AppPayload, { kind: "session-ready" }>) {
     const currentPeer = peerRef.current;
     if (!currentPeer) return;
+
+    if (
+      awaitingIncomingRemovalAckRef.current &&
+      payload.kind !== "clear-chat-request" &&
+      payload.kind !== "clear-chat-response"
+    ) {
+      logDiagnostic("chat", "payload-ignored-during-conversation-removal", { kind: payload.kind }, "warn");
+      return;
+    }
 
     if (payload.kind === "chat-message") {
       const existing = await db.messages.get(payload.id);
@@ -726,27 +1042,83 @@ export default function App() {
     }
 
     if (payload.kind === "clear-chat-request") {
+      const awaitingAck = awaitingIncomingRemovalAckRef.current;
+      if (awaitingAck) {
+        await connection.send({
+          kind: "clear-chat-response",
+          id: payload.id,
+          accepted: awaitingAck.id === payload.id && payload.removeConversation === true,
+          ...(payload.removeConversation === true ? { removeConversation: true } : {}),
+        });
+        return;
+      }
       if (incomingClearRequestRef.current) {
-        if (incomingClearRequestRef.current !== payload.id) {
-          await connection.send({ kind: "clear-chat-response", id: payload.id, accepted: false });
+        if (incomingClearRequestRef.current.id !== payload.id) {
+          await connection.send({
+            kind: "clear-chat-response",
+            id: payload.id,
+            accepted: false,
+            ...(payload.removeConversation === true ? { removeConversation: true } : {}),
+          });
         }
         return;
       }
-      incomingClearRequestRef.current = payload.id;
-      setIncomingClearRequest(payload.id);
+      const operation = { id: payload.id, removeConversation: payload.removeConversation === true };
+      incomingClearRequestRef.current = operation;
+      setIncomingClearRequest(operation);
       return;
     }
 
     if (payload.kind === "clear-chat-response") {
-      if (pendingClearRequestRef.current !== payload.id) return;
+      const awaitingAck = awaitingIncomingRemovalAckRef.current;
+      if (
+        awaitingAck?.id === payload.id &&
+        awaitingAck.removeConversation &&
+        payload.accepted &&
+        payload.removeConversation === true
+      ) {
+        finishIncomingRemovalAckWait();
+        goToChats();
+        setChatListNotice(chatHubCopy[language].deletedBoth);
+        return;
+      }
+
+      const operation = pendingClearRequestRef.current;
+      if (!operation || operation.id !== payload.id) return;
       finishPendingClearRequest();
       if (!payload.accepted) {
+        if (operation.removeConversation) clearResumableIntent();
         setHistoryNotice(t("notice.clearDeclined"));
         return;
       }
       try {
-        await clearChatLocally(currentPeer.id, connection);
-        setHistoryNotice(t("notice.clearedEveryone"));
+        await clearChatLocally(currentPeer.id, connection, operation.removeConversation);
+        if (operation.removeConversation) {
+          clearResumableIntent();
+          if (payload.removeConversation === true) {
+            try {
+              await connection.send({
+                kind: "clear-chat-response",
+                id: operation.id,
+                accepted: true,
+                removeConversation: true,
+              });
+              // Give the reliable DataChannel a short window to flush the final
+              // acknowledgement before closing this one-time connection.
+              await new Promise((resolve) => window.setTimeout(resolve, 250));
+            } catch (reason) {
+              logDiagnostic("chat", "conversation-removal-ack-failed", {
+                reason: safeErrorText(reason),
+              }, "warn");
+            }
+          }
+          goToChats();
+          setChatListNotice(payload.removeConversation === true
+            ? chatHubCopy[language].deletedBoth
+            : chatHubCopy[language].deletedBothLegacy);
+        } else {
+          setHistoryNotice(t("notice.clearedEveryone"));
+        }
       } catch {
         setHistoryNotice(t("notice.clearedRemoteLocalFailed"));
       }
@@ -1196,8 +1568,9 @@ export default function App() {
     }
   }
 
-  async function requestClearForEveryone() {
-    if (!peer) return;
+  async function requestClearForEveryone(removeConversation = false, requestedId?: string) {
+    const currentPeer = peerRef.current;
+    if (!currentPeer) return;
     setShowClearDialog(false);
     setHistoryNotice("");
     const connection = connectionRef.current;
@@ -1206,47 +1579,77 @@ export default function App() {
       return;
     }
 
-    const id = crypto.randomUUID();
-    pendingClearRequestRef.current = id;
-    setPendingClearRequest(id);
+    const id = requestedId ?? crypto.randomUUID();
+    const operation = { id, removeConversation };
+    pendingClearRequestRef.current = operation;
+    setPendingClearRequest(operation);
     setHistoryNotice(t("notice.clearWaiting"));
     pendingClearTimerRef.current = window.setTimeout(() => {
-      if (pendingClearRequestRef.current !== id) return;
+      if (pendingClearRequestRef.current?.id !== id) return;
       finishPendingClearRequest();
+      if (removeConversation) clearResumableIntent();
       setHistoryNotice(t("notice.clearTimeout"));
     }, 20_000);
     try {
-      await connection.send({ kind: "clear-chat-request", id });
+      await connection.send({
+        kind: "clear-chat-request",
+        id,
+        ...(removeConversation ? { removeConversation: true } : {}),
+      });
     } catch (reason) {
       finishPendingClearRequest();
+      if (removeConversation) clearResumableIntent();
       setHistoryNotice(reason instanceof Error ? reason.message : t("notice.clearRequestFailed"));
     }
   }
 
   async function acceptIncomingClearRequest() {
-    const id = incomingClearRequestRef.current;
+    const operation = incomingClearRequestRef.current;
     const currentPeer = peerRef.current;
     const connection = connectionRef.current;
-    if (!id || !currentPeer || !connection) return;
+    if (!operation || !currentPeer || !connection) return;
     incomingClearRequestRef.current = null;
     setIncomingClearRequest(null);
     try {
-      await clearChatLocally(currentPeer.id, connection);
-      await connection.send({ kind: "clear-chat-response", id, accepted: true });
-      setHistoryNotice(t("notice.clearedEveryone"));
+      await clearChatLocally(currentPeer.id, connection, operation.removeConversation);
+      if (operation.removeConversation) beginIncomingRemovalAckWait(operation);
+      await connection.send({
+        kind: "clear-chat-response",
+        id: operation.id,
+        accepted: true,
+        ...(operation.removeConversation ? { removeConversation: true } : {}),
+      });
+      if (operation.removeConversation) {
+        setHistoryNotice(chatHubCopy[language].waitingRemovalAck);
+      } else {
+        setHistoryNotice(t("notice.clearedEveryone"));
+      }
     } catch (reason) {
-      setHistoryNotice(reason instanceof Error ? reason.message : t("notice.clearFinishFailed"));
+      if (operation.removeConversation) {
+        finishIncomingRemovalAckWait();
+        goToChats();
+        setChatListNotice(chatHubCopy[language].deletedHereOnly);
+      } else {
+        setHistoryNotice(reason instanceof Error ? reason.message : t("notice.clearFinishFailed"));
+      }
     }
   }
 
   async function declineIncomingClearRequest() {
-    const id = incomingClearRequestRef.current;
+    const operation = incomingClearRequestRef.current;
     const connection = connectionRef.current;
-    if (!id) return;
+    if (!operation) return;
     incomingClearRequestRef.current = null;
     setIncomingClearRequest(null);
     try {
-      if (connection) await connection.send({ kind: "clear-chat-response", id, accepted: false });
+      if (connection) {
+        await connection.send({
+          kind: "clear-chat-response",
+          id: operation.id,
+          accepted: false,
+          ...(operation.removeConversation ? { removeConversation: true } : {}),
+        });
+      }
       setHistoryNotice(t("notice.clearRejected"));
     } catch (reason) {
       setHistoryNotice(reason instanceof Error ? reason.message : t("notice.clearRejectFailed"));
@@ -1256,6 +1659,7 @@ export default function App() {
   async function clearChatLocally(
     chatId: string,
     connection: DirectTalkConnection | null,
+    removeConversation = false,
   ) {
     chatGenerationRef.current += 1;
     await cancelAllPhotoTransfers(connection);
@@ -1264,11 +1668,14 @@ export default function App() {
     setMessageMenuId(null);
     setDeleteConfirmation(null);
     setPhotoError("");
-
-    await db.transaction("rw", db.messages, db.attachments, async () => {
-      await db.attachments.where("chatId").equals(chatId).delete();
-      await db.messages.where("chatId").equals(chatId).delete();
-    });
+    if (removeConversation) {
+      await hideChatLocally(chatId);
+    } else {
+      await db.transaction("rw", db.messages, db.attachments, async () => {
+        await db.attachments.where("chatId").equals(chatId).delete();
+        await db.messages.where("chatId").equals(chatId).delete();
+      });
+    }
     setMessages([]);
     setAttachments({});
   }
@@ -1309,6 +1716,27 @@ export default function App() {
     pendingClearTimerRef.current = null;
     pendingClearRequestRef.current = null;
     setPendingClearRequest(null);
+  }
+
+  function beginIncomingRemovalAckWait(operation: ClearChatOperation) {
+    finishIncomingRemovalAckWait();
+    awaitingIncomingRemovalAckRef.current = operation;
+    setAwaitingRemovalAck(true);
+    incomingRemovalAckTimerRef.current = window.setTimeout(() => {
+      if (awaitingIncomingRemovalAckRef.current?.id !== operation.id) return;
+      finishIncomingRemovalAckWait();
+      goToChats();
+      setChatListNotice(chatHubCopy[language].deletedHereOnly);
+    }, 20_000);
+  }
+
+  function finishIncomingRemovalAckWait() {
+    if (incomingRemovalAckTimerRef.current !== null) {
+      window.clearTimeout(incomingRemovalAckTimerRef.current);
+    }
+    incomingRemovalAckTimerRef.current = null;
+    awaitingIncomingRemovalAckRef.current = null;
+    setAwaitingRemovalAck(false);
   }
 
   async function verifyContact() {
@@ -1354,8 +1782,8 @@ export default function App() {
     if (next) void appSounds.play("startup");
   }
 
-  function reset() {
-    logDiagnostic("app", "returned-home");
+  function closeActiveConversation() {
+    chatListOperationRef.current += 1;
     connectionGenerationRef.current += 1;
     chatGenerationRef.current += 1;
     for (const id of outgoingPhotosRef.current.keys()) cancelledPhotosRef.current.add(id);
@@ -1380,6 +1808,8 @@ export default function App() {
     clearPendingDeletes();
     clearDeliveryWatches();
     finishPendingClearRequest();
+    finishIncomingRemovalAckWait();
+    pendingConversationRemovalRef.current = null;
     incomingClearRequestRef.current = null;
     setIncomingClearRequest(null);
     setMessageMenuId(null);
@@ -1395,6 +1825,23 @@ export default function App() {
     setShowEmoji(false);
     setShowSecurity(false);
     setConnectionState("closed");
+  }
+
+  function goToChats() {
+    logDiagnostic("app", "returned-chat-list");
+    closeActiveConversation();
+    setChatListBusyId(null);
+    setChatDeleteTarget(null);
+    setChatListNotice("");
+    setScreen("chats");
+  }
+
+  function goToNewChat() {
+    logDiagnostic("app", "new-chat-opened");
+    closeActiveConversation();
+    setChatListBusyId(null);
+    setChatDeleteTarget(null);
+    setChatListNotice("");
     setScreen("home");
   }
 
@@ -1402,12 +1849,15 @@ export default function App() {
   const activeContact = contact;
   const activeMessages = messages;
   const activeAttachments = attachments;
+  const hubCopy = chatHubCopy[language];
   const incomingTransfers = Object.values(photoTransfers).filter(
     (transfer) => transfer.direction === "incoming" && transfer.status !== "complete",
   );
   const isConversationOpen = screen === "chat";
   const connectionReady = connectionState === "secure";
-  const chatMarkState: OxalisState = connectionReady ? "online" : "connecting";
+  const conversationInteractive = connectionReady && !awaitingRemovalAck && !pendingClearRequest?.removeConversation;
+  const offlineHistory = isConversationOpen && connectionState === "closed";
+  const chatMarkState: OxalisState = connectionReady ? "online" : offlineHistory ? "offline" : "connecting";
   const logoState: OxalisState = isConversationOpen
     ? chatMarkState
     : screen === "loading" || screen === "waiting"
@@ -1419,7 +1869,7 @@ export default function App() {
       {showSplash && <SplashScreen />}
       <main className={`app-shell ${isConversationOpen ? "chat-open" : ""}`} data-theme={theme}>
       <header className="topbar">
-        <button className="brand" type="button" onClick={screen === "home" ? undefined : reset} aria-label={t("top.home")}>
+        <button className="brand" type="button" onClick={screen === "chats" ? undefined : goToChats} aria-label={t("top.home")}>
           <OxalisMark state={logoState} />
           <span className="brand-copy"><strong>DirectTalk</strong><small>peer-to-peer messenger</small></span>
         </button>
@@ -1502,9 +1952,60 @@ export default function App() {
 
       {screen === "loading" && <StatusCard windowTitle={t("loading.window")} title={t("loading.title")} description={t("loading.description")} />}
 
+      {screen === "chats" && (
+        <section className="card chats-card y2k-window">
+          <WindowTitlebar title={hubCopy.window} markState="offline" />
+          {chatListNotice && (
+            <div className="history-notice chat-list-notice" role="status">
+              <span>{chatListNotice}</span>
+              <button type="button" onClick={() => setChatListNotice("")} aria-label={t("notice.close")}>×</button>
+            </div>
+          )}
+          <ChatListCard
+            summaries={chatSummaries}
+            language={language}
+            copy={hubCopy}
+            busyId={chatListBusyId}
+            onNewChat={goToNewChat}
+            onOpen={(summary) => void openSavedChat(summary)}
+            onReconnect={(summary) => reconnectSavedChat(summary)}
+            onDelete={setChatDeleteTarget}
+          />
+          <div className="window-statusbar">
+            <span>● {hubCopy.localOnly}</span>
+            <span>{chatSummaries.length} · {hubCopy.listStatus}</span>
+            <span>v{APP_VERSION}</span>
+          </div>
+
+          {chatDeleteTarget && (
+            <div className="dialog-backdrop" role="presentation">
+              <section className="confirm-dialog clear-dialog" role="dialog" aria-modal="true" aria-labelledby="chat-delete-dialog-title">
+                <WindowTitlebar title={hubCopy.deleteWindow} onClose={() => setChatDeleteTarget(null)} closeLabel={t("common.close")} markState="offline" />
+                <div className="confirm-dialog-body">
+                  <div className="confirm-dialog-icon">!</div>
+                  <div>
+                    <h2 id="chat-delete-dialog-title">{hubCopy.deleteTitle}</h2>
+                    <p>{hubCopy.deleteDescription}</p>
+                  </div>
+                </div>
+                <div className="clear-dialog-options">
+                  <button type="button" onClick={() => void deleteSavedChatLocally()}>
+                    <strong>{hubCopy.deleteLocal}</strong><span>{hubCopy.deleteLocalDescription}</span>
+                  </button>
+                  <button type="button" onClick={deleteSavedChatForBoth}>
+                    <strong>{hubCopy.deleteBoth}</strong><span>{hubCopy.deleteBothDescription}</span>
+                  </button>
+                </div>
+                <div className="confirm-dialog-actions"><button type="button" onClick={() => setChatDeleteTarget(null)}>{t("common.cancel")}</button></div>
+              </section>
+            </div>
+          )}
+        </section>
+      )}
+
       {screen === "home" && (
         <section className="card home-card y2k-window">
-          <WindowTitlebar title={incomingInvite ? t("home.incomingWindow") : t("home.newWindow")} markState="offline" />
+          <WindowTitlebar title={incomingInvite ? t("home.incomingWindow") : t("home.newWindow")} onClose={goToChats} closeLabel={t("common.close")} markState="offline" />
           <div className="home-body">
             <div className="welcome-mark offline"><i className="status-dot" aria-hidden="true" /><span>{t("peer.offline")}</span></div>
             <div className="eyebrow">{t("home.eyebrow")}</div>
@@ -1560,6 +2061,8 @@ export default function App() {
                 ? t("waiting.restore")
                 : t("waiting.channel")}</h1>
 
+            {chatListNotice && <p className="waiting-context-notice" role="status">{chatListNotice}</p>}
+
             {inviteLink && (connectionState === "waiting-peer" || connectionState === "waiting-reconnect") && (
               <div className="invite-layout">
                 {qrCode && <img className="qr-code" src={qrCode} alt={t("waiting.qrAlt")} />}
@@ -1575,7 +2078,7 @@ export default function App() {
             )}
 
             {connectionState !== "waiting-peer" && <div className="connection-steps"><span className="active" /><span className="active" /><span /></div>}
-            <button className="text-button" type="button" onClick={reset}>{t("waiting.cancel")}</button>
+            <button className="text-button" type="button" onClick={goToChats}>{t("waiting.cancel")}</button>
           </div>
           <div className="window-statusbar"><span>● DirectTalk network</span><span>{t("waiting.encryption")}</span></div>
         </section>
@@ -1585,7 +2088,7 @@ export default function App() {
         <section className="chat-card y2k-window">
           <WindowTitlebar
             title={`${activePeer.name} — ${t("chat.title")}`}
-            onClose={reset}
+            onClose={goToChats}
             closeLabel={t("common.close")}
             markState={chatMarkState}
             extra={(
@@ -1619,38 +2122,47 @@ export default function App() {
             type="file"
             accept="image/jpeg,image/png,image/webp,image/gif"
             onChange={(event) => void handlePhotoSelection(event)}
-            disabled={!connectionReady}
+            disabled={!conversationInteractive}
             tabIndex={-1}
           />
 
           <nav className="chat-toolbar" aria-label={t("chat.tools")}>
             <button className="active" type="button"><span>▤</span>{t("chat.messages")}</button>
-            <button type="button" onClick={() => photoInputRef.current?.click()} disabled={!connectionReady} title={t("chat.photoTooltip")}><span>▧</span>{t("chat.photo")}<small>{t("chat.upTo10")}</small></button>
+            <button type="button" onClick={() => photoInputRef.current?.click()} disabled={!conversationInteractive} title={t("chat.photoTooltip")}><span>▧</span>{t("chat.photo")}<small>{t("chat.upTo10")}</small></button>
             <button type="button" disabled title={t("chat.voiceTooltip")}><span>◉</span>{t("chat.voice")}<small>{t("chat.soon")}</small></button>
             <button type="button" disabled title={t("chat.callTooltip")}><span>☎</span>{t("chat.call")}<small>{t("chat.soon")}</small></button>
-            <button type="button" onClick={() => setShowClearDialog(true)} disabled={Boolean(pendingClearRequest)} title={t("chat.clearTooltip")}><span>⌫</span>{t("chat.clear")}<small>{pendingClearRequest ? t("chat.waiting") : t("chat.history")}</small></button>
+            <button type="button" onClick={() => setShowClearDialog(true)} disabled={Boolean(pendingClearRequest) || awaitingRemovalAck} title={t("chat.clearTooltip")}><span>⌫</span>{t("chat.clear")}<small>{pendingClearRequest || awaitingRemovalAck ? t("chat.waiting") : t("chat.history")}</small></button>
             <button className="security-tool" type="button" onClick={() => setShowSecurity(!showSecurity)}><span>◆</span>{t("chat.security")}</button>
           </nav>
 
           {!connectionReady && (
-            <div className="reconnect-banner" role="status" aria-live="polite">
-              <OxalisMark state="connecting" />
-              <div><strong>{t("peer.reconnecting")}</strong><span>{t("chat.reconnecting")}</span></div>
+            <div className={`reconnect-banner ${offlineHistory ? "offline" : ""}`} role="status" aria-live="polite">
+              <OxalisMark state={offlineHistory ? "offline" : "connecting"} />
+              <div>
+                <strong>{offlineHistory ? hubCopy.offlineTitle : t("peer.reconnecting")}</strong>
+                <span>{offlineHistory ? hubCopy.offlineDescription : t("chat.reconnecting")}</span>
+              </div>
+              {offlineHistory && <button type="button" onClick={() => reconnectContact(activeContact)}>{hubCopy.reconnect}</button>}
             </div>
           )}
 
           {showSecurity && (
             <aside className="security-panel">
-              <div>
-                <span>{t("security.code")}</span>
-                <code>{activePeer.securityCode}</code>
-              </div>
-              <p>{t("security.description")}</p>
+              {!offlineHistory && (
+                <>
+                  <div>
+                    <span>{t("security.code")}</span>
+                    <code>{activePeer.securityCode}</code>
+                  </div>
+                  <p>{t("security.description")}</p>
+                </>
+              )}
+              {offlineHistory && <p>{hubCopy.offlineSecurity}</p>}
               <details>
                 <summary>{t("security.fingerprint")}</summary>
                 <code>{activePeer.fingerprint}</code>
               </details>
-              {!activeContact.verified && <button type="button" onClick={() => void verifyContact()}>{t("security.match")}</button>}
+              {!activeContact.verified && connectionReady && <button type="button" onClick={() => void verifyContact()}>{t("security.match")}</button>}
             </aside>
           )}
 
@@ -1660,7 +2172,12 @@ export default function App() {
                 {connectionReady && <div className="session-notice"><LockIcon /> {t("session.secure")} · {formatTime(sessionStartedAtRef.current, language)}</div>}
                 {incomingClearRequest && (
                   <section className="history-clear-request" role="alert">
-                    <div><strong>{t("clearRequest.title", { name: activePeer.name })}</strong><span>{t("clearRequest.description")}</span></div>
+                    <div>
+                      <strong>{incomingClearRequest.removeConversation
+                        ? hubCopy.incomingDeleteTitle.replace("{name}", activePeer.name)
+                        : t("clearRequest.title", { name: activePeer.name })}</strong>
+                      <span>{incomingClearRequest.removeConversation ? hubCopy.incomingDeleteDescription : t("clearRequest.description")}</span>
+                    </div>
                     <div>
                       <button type="button" onClick={() => void acceptIncomingClearRequest()}>{t("clearRequest.accept")}</button>
                       <button type="button" onClick={() => void declineIncomingClearRequest()}>{t("clearRequest.keep")}</button>
@@ -1694,8 +2211,8 @@ export default function App() {
                 {activeMessages.length === 0 && incomingPhotoOffers.length === 0 && incomingTransfers.length === 0 && (
                   <div className="empty-chat">
                     <OxalisMark state={chatMarkState} />
-                    <strong>{connectionReady ? t("empty.online", { name: activePeer.name }) : t("peer.reconnecting")}</strong>
-                    <span>{connectionReady ? t("empty.prompt") : t("chat.reconnecting")}</span>
+                    <strong>{connectionReady ? t("empty.online", { name: activePeer.name }) : offlineHistory ? hubCopy.offlineTitle : t("peer.reconnecting")}</strong>
+                    <span>{connectionReady ? t("empty.prompt") : offlineHistory ? hubCopy.offlineDescription : t("chat.reconnecting")}</span>
                   </div>
                 )}
                 {activeMessages.map((message) => (
@@ -1728,7 +2245,7 @@ export default function App() {
                           setDeleteConfirmation({ messageId: message.id, scope: "local" });
                         }}>{t("message.deleteLocal")}</button>
                         {message.sender === "me" && (
-                          <button type="button" role="menuitem" disabled={!connectionReady} onClick={() => {
+                          <button type="button" role="menuitem" disabled={!conversationInteractive} onClick={() => {
                             setMessageMenuId(null);
                             setDeleteConfirmation({ messageId: message.id, scope: "everyone" });
                           }}>{t("message.deleteEveryone")}</button>
@@ -1754,6 +2271,7 @@ export default function App() {
                   rows={3}
                   placeholder={t("message.placeholder", { name: activePeer.name })}
                   aria-label={t("message.label")}
+                  disabled={!conversationInteractive}
                 />
 
                 {showEmoji && (
@@ -1776,14 +2294,15 @@ export default function App() {
                       className={showEmoji ? "active" : ""}
                       type="button"
                       onClick={() => setShowEmoji((visible) => !visible)}
+                      disabled={!conversationInteractive}
                       aria-expanded={showEmoji}
                       title={t("emoji.label")}
                     >☺</button>
-                    <button type="button" onClick={() => photoInputRef.current?.click()} disabled={!connectionReady} title={t("composer.photoTooltip")}>📎</button>
+                    <button type="button" onClick={() => photoInputRef.current?.click()} disabled={!conversationInteractive} title={t("composer.photoTooltip")}>📎</button>
                     <button type="button" disabled title={t("composer.voiceTooltip")}>🎙</button>
                   </div>
                   <span className="draft-counter">{draft.length}/4000</span>
-                  <button className="send-button" type="submit" disabled={!draft.trim() || !connectionReady}>{t("common.send")}</button>
+                  <button className="send-button" type="submit" disabled={!draft.trim() || !conversationInteractive}>{t("common.send")}</button>
                 </div>
               </form>
             </div>
@@ -1791,20 +2310,20 @@ export default function App() {
             <aside className="peer-sidebar">
               <div className="peer-avatar" aria-hidden="true">{activePeer.name.slice(0, 1).toUpperCase()}</div>
               <div className="peer-online"><OxalisMark state={chatMarkState} /><strong>{activePeer.name}</strong></div>
-              <span className={`presence ${connectionReady ? "" : "reconnecting"}`}>● {connectionReady ? t("peer.online") : t("peer.reconnecting")}</span>
+              <span className={`presence ${connectionReady ? "" : "reconnecting"}`}>● {connectionReady ? t("peer.online") : offlineHistory ? hubCopy.offlinePresence : t("peer.reconnecting")}</span>
               <div className="peer-divider" />
               <button type="button" className={activeContact.verified ? "verified" : ""} onClick={() => setShowSecurity(!showSecurity)}>
                 <LockIcon />
                 {activeContact.verified ? t("peer.verified") : t("peer.compare")}
               </button>
-              <p>{t("peer.directDescription")}</p>
+              <p>{offlineHistory ? hubCopy.offlineDescription : t("peer.directDescription")}</p>
             </aside>
           </div>
 
           {deleteConfirmation && (
             <div className="dialog-backdrop" role="presentation">
               <section className="confirm-dialog" role="dialog" aria-modal="true" aria-labelledby="delete-dialog-title">
-                <WindowTitlebar title={t("delete.window")} onClose={() => setDeleteConfirmation(null)} closeLabel={t("common.close")} markState="online" />
+                <WindowTitlebar title={t("delete.window")} onClose={() => setDeleteConfirmation(null)} closeLabel={t("common.close")} markState={chatMarkState} />
                 <div className="confirm-dialog-body">
                   <div className="confirm-dialog-icon">!</div>
                   <div>
@@ -1825,7 +2344,7 @@ export default function App() {
           {showClearDialog && (
             <div className="dialog-backdrop" role="presentation">
               <section className="confirm-dialog clear-dialog" role="dialog" aria-modal="true" aria-labelledby="clear-dialog-title">
-                <WindowTitlebar title={t("clear.window")} onClose={() => setShowClearDialog(false)} closeLabel={t("common.close")} markState="online" />
+                <WindowTitlebar title={t("clear.window")} onClose={() => setShowClearDialog(false)} closeLabel={t("common.close")} markState={chatMarkState} />
                 <div className="confirm-dialog-body">
                   <div className="confirm-dialog-icon">!</div>
                   <div>
@@ -1842,7 +2361,7 @@ export default function App() {
             </div>
           )}
 
-          <div className="window-statusbar"><span>● {activePeer.name}: {connectionReady ? t("peer.online") : t("peer.reconnecting")}</span><span>{t("status.messages", { count: activeMessages.length })}</span><span>{connectionReady ? "WebRTC · E2EE" : t("state.reconnecting")}</span></div>
+          <div className="window-statusbar"><span>● {activePeer.name}: {connectionReady ? t("peer.online") : offlineHistory ? hubCopy.offlinePresence : t("peer.reconnecting")}</span><span>{t("status.messages", { count: activeMessages.length })}</span><span>{connectionReady ? "WebRTC · E2EE" : offlineHistory ? hubCopy.localOnly : t("state.reconnecting")}</span></div>
         </section>
       )}
 
@@ -1855,7 +2374,7 @@ export default function App() {
             <p>{localizeRuntimeMessage(language, error)}</p>
             {errorDiagnosticId !== null && <code className="error-diagnostic-id">Diagnostic ID #{errorDiagnosticId}</code>}
             <button className="diagnostics-error-button" type="button" onClick={() => setShowDiagnostics(true)}>{diagnosticsCopy[language].button}</button>
-            <button className="primary-button" type="button" onClick={reset}>{t("error.back")}</button>
+            <button className="primary-button" type="button" onClick={goToChats}>{t("error.back")}</button>
           </div>
         </section>
       )}

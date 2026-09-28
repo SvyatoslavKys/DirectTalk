@@ -13,10 +13,11 @@ A minimal private chat between two browsers. The signaling server only relays SD
 - a persistent local device key and signed ephemeral session keys;
 - a safety code and persistent verified-contact status;
 - local chat history through Dexie/IndexedDB;
+- a local chat list with last-message previews, offline read-only history, and identity-pinned reconnection through a fresh one-time invitation;
 - `delivered` and `read` receipts;
 - direct transfer of JPEG, PNG, WebP, and GIF images up to 10 MB: the recipient approves the download, data is sent in encrypted chunks with backpressure, and the completed file is verified with SHA-256;
 - local deletion of any message and confirmed deletion of the user's own sent messages from both participants;
-- complete local chat clearing, or a request to clear both copies with the peer's explicit consent;
+- complete local chat clearing, local conversation removal without forgetting the verified device identity, or a live request to remove both copies with the peer's explicit consent;
 - English, Polish, Russian, and Ukrainian interfaces with browser-language detection and a locally remembered manual choice;
 - a theme-aware animated oxalis mark that folds while offline and opens for a secure session;
 - startup, connection, and disconnection cues generated locally with Web Audio, enabled by default with a remembered mute setting;
@@ -45,6 +46,8 @@ After a reload, DirectTalk rejoins the signaling room, creates a new peer connec
 This is session recovery, not an account login. If both browsers are offline at different times, DirectTalk has no server inbox and cannot deliver messages later. A restrictive network still needs a working TURN route.
 
 Conversation history is matched to the remote browser profile's long-lived public identity key, not to its nickname or invitation link. A new invitation to the same browser profile therefore opens the same locally stored thread even if the nickname changed. A different browser profile, private-browsing session, device, or cleared site data creates a different identity and a separate thread. Each participant has an independent local copy; the server never reconstructs or synchronizes history.
+
+The chat list is also entirely local. Opening an old entry shows its saved history without claiming that the other device is online. **Reconnect** creates a new one-time invitation pinned to that contact's existing identity key; the link still has to be delivered through another channel. Deleting a chat locally removes its messages and photos but keeps the contact key and verification state so a later reconnection cannot silently replace the known device. **Request deletion from both** first reconnects the same authenticated device, then sends an end-to-end encrypted request. The peer must explicitly confirm. The server never queues this request; it is sent only after both devices establish a live secure session.
 
 ## Deploy to Vercel
 
@@ -136,8 +139,9 @@ src/lib/photos.ts      image validation, chunking, and hashing
 src/lib/i18n.ts        translations, language detection, and runtime-error localization
 src/lib/diagnostics.ts privacy-safe in-browser connection diagnostics
 src/lib/sounds.ts      local procedural interface sounds and their preference
-src/lib/sessionResume.ts validated, expiring same-tab reload context
-src/lib/database.ts    device key, contacts, messages, and attachments
+src/lib/sessionResume.ts validated, expiring same-tab reload and pending-action context
+src/lib/database.ts    device key, contacts, chat summaries, messages, and attachments
+src/components/ChatListCard.tsx local saved-chat list presentation
 server/signaling.mjs   signaling protocol and in-memory/Redis coordination
 server/index.mjs       local signaling-server entrypoint
 api/signal.mjs         Vercel WebSocket Function entrypoint

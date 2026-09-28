@@ -84,6 +84,8 @@ For reload recovery, the current tab also keeps the invitation capability, parti
 - Any message can be deleted from the user's own IndexedDB.
 - With “delete for both,” a participant can ask the peer to delete only a message that participant originally sent. The recipient checks the stored message direction and rejects attempts to delete the recipient's own messages.
 - Clearing both copies is never performed automatically by a remote command. The other participant sees a request and must explicitly accept it.
+- Removing a saved conversation locally deletes its messages and attachments but deliberately retains the contact's public identity and verification state. A future invitation to the same device can therefore be pinned to the previously authenticated key.
+- “Delete chat for both” is a live, consent-based request: DirectTalk creates a fresh one-time invitation pinned to the known device, reconnects, and asks the peer to remove its local copy. It is not an offline server command.
 - Deletion commands travel inside the end-to-end encrypted session and work only while both browsers are connected. The server does not queue deletion commands.
 - Deletion is best effort. A modified client can ignore a request, and DirectTalk cannot erase an exported file, backup, screenshot, or data stored in another browser profile.
 - Removing an IndexedDB record does not guarantee physical erasure of storage blocks. High-assurance environments should use full-disk encryption and delete the complete browser profile when necessary.

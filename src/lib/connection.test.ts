@@ -973,12 +973,29 @@ describe("photo packet validation", () => {
       deleted: true,
     });
     expect(parseAppPayload({ kind: "clear-chat-request", id })).toEqual({ kind: "clear-chat-request", id });
+    expect(parseAppPayload({ kind: "clear-chat-request", id, removeConversation: true })).toEqual({
+      kind: "clear-chat-request",
+      id,
+      removeConversation: true,
+    });
     expect(parseAppPayload({ kind: "clear-chat-response", id, accepted: false })).toEqual({
       kind: "clear-chat-response",
       id,
       accepted: false,
     });
+    expect(parseAppPayload({ kind: "clear-chat-response", id, accepted: true, removeConversation: true })).toEqual({
+      kind: "clear-chat-response",
+      id,
+      accepted: true,
+      removeConversation: true,
+    });
     expect(() => parseAppPayload({ kind: "delete-message", messageId: "demo-1" })).toThrow("некорректный пакет");
     expect(() => parseAppPayload({ kind: "clear-chat-response", id, accepted: "yes" })).toThrow("некорректный пакет");
+    expect(() => parseAppPayload({ kind: "clear-chat-request", id, removeConversation: "yes" })).toThrow(
+      "некорректный пакет",
+    );
+    expect(() =>
+      parseAppPayload({ kind: "clear-chat-response", id, accepted: true, removeConversation: 1 }),
+    ).toThrow("некорректный пакет");
   });
 });

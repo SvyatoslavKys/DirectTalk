@@ -18,6 +18,7 @@ export interface StoredMessage {
   text: string;
   createdAt: number;
   status: MessageStatus;
+  readReceiptPending?: boolean;
   kind?: "text" | "photo";
   attachmentId?: string;
 }
@@ -42,6 +43,15 @@ export interface StoredContact {
   verified: boolean;
   firstSeenAt: number;
   lastSeenAt: number;
+  hiddenAt?: number;
+}
+
+export interface StoredChatSummary {
+  contact: StoredContact;
+  lastMessage?: StoredMessage;
+  messageCount: number;
+  unreadCount: number;
+  activityAt: number;
 }
 
 class DirectTalkDatabase extends Dexie {
@@ -108,4 +118,62 @@ export async function loadMessages(chatId: string): Promise<StoredMessage[]> {
 
 export async function loadAttachments(chatId: string): Promise<StoredAttachment[]> {
   return db.attachments.where("chatId").equals(chatId).toArray();
+}
+
+export function aggregateChatSummaries(
+  contacts: readonly StoredContact[],
+  messages: readonly StoredMessage[],
+): StoredChatSummary[] {
+  const summaries = new Map<string, StoredChatSummary>();
+
+  for (const contact of contacts) {
+    if (contact.hiddenAt !== undefined) continue;
+    summaries.set(contact.id, {
+      contact,
+      messageCount: 0,
+      unreadCount: 0,
+      activityAt: contact.lastSeenAt,
+    });
+  }
+
+  for (const message of messages) {
+    const summary = summaries.get(message.chatId);
+    if (!summary) continue;
+
+    summary.messageCount += 1;
+    if (message.sender === "peer" && message.status !== "read") summary.unreadCount += 1;
+
+    const previous = summary.lastMessage;
+    if (
+      !previous ||
+      message.createdAt > previous.createdAt ||
+      (message.createdAt === previous.createdAt && message.id.localeCompare(previous.id) > 0)
+    ) {
+      summary.lastMessage = message;
+    }
+    summary.activityAt = Math.max(summary.activityAt, message.createdAt);
+  }
+
+  return [...summaries.values()].sort((left, right) =>
+    right.activityAt - left.activityAt || left.contact.id.localeCompare(right.contact.id),
+  );
+}
+
+export async function loadChatSummaries(): Promise<StoredChatSummary[]> {
+  return db.transaction("r", db.contacts, db.messages, async () => {
+    const [contacts, messages] = await Promise.all([
+      db.contacts.toArray(),
+      db.messages.toArray(),
+    ]);
+    return aggregateChatSummaries(contacts, messages);
+  });
+}
+
+export async function hideChatLocally(chatId: string, now = Date.now()): Promise<void> {
+  await db.transaction("rw", db.contacts, db.messages, db.attachments, async () => {
+    const contact = await db.contacts.get(chatId);
+    await db.attachments.where("chatId").equals(chatId).delete();
+    await db.messages.where("chatId").equals(chatId).delete();
+    if (contact) await db.contacts.put({ ...contact, hiddenAt: now });
+  });
 }

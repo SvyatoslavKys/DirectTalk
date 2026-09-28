@@ -63,8 +63,8 @@ export type AppPayload =
   | { kind: "photo-cancel"; id: string; reason: PhotoCancelReason }
   | { kind: "delete-message"; messageId: string }
   | { kind: "delete-message-result"; messageId: string; deleted: boolean }
-  | { kind: "clear-chat-request"; id: string }
-  | { kind: "clear-chat-response"; id: string; accepted: boolean };
+  | { kind: "clear-chat-request"; id: string; removeConversation?: boolean }
+  | { kind: "clear-chat-response"; id: string; accepted: boolean; removeConversation?: boolean };
 
 export type PhotoCancelReason = "cancelled" | "invalid" | "hash-mismatch" | "unsupported" | "transfer-failed";
 export type PhotoOfferPayload = Extract<AppPayload, { kind: "photo-offer" }>;
@@ -1646,10 +1646,19 @@ export function parseAppPayload(value: unknown): AppPayload {
   ) {
     return payload as unknown as AppPayload;
   }
-  if (payload.kind === "clear-chat-request" && isUuid(payload.id)) {
+  if (
+    payload.kind === "clear-chat-request" &&
+    isUuid(payload.id) &&
+    (payload.removeConversation === undefined || typeof payload.removeConversation === "boolean")
+  ) {
     return payload as unknown as AppPayload;
   }
-  if (payload.kind === "clear-chat-response" && isUuid(payload.id) && typeof payload.accepted === "boolean") {
+  if (
+    payload.kind === "clear-chat-response" &&
+    isUuid(payload.id) &&
+    typeof payload.accepted === "boolean" &&
+    (payload.removeConversation === undefined || typeof payload.removeConversation === "boolean")
+  ) {
     return payload as unknown as AppPayload;
   }
   throw new Error("Получен неизвестный или некорректный пакет");

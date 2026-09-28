@@ -14,6 +14,9 @@ export interface ResumableSession {
   role: PeerRole;
   displayName: string;
   expectedPeerIdentity?: string;
+  sharePending?: boolean;
+  intent?: "remove-conversation";
+  intentId?: string;
   savedAt: number;
 }
 
@@ -68,6 +71,23 @@ export function updateResumablePeerIdentity(
     role: current.role,
     displayName: current.displayName,
     expectedPeerIdentity,
+    ...(current.intent ? { intent: current.intent } : {}),
+    ...(current.intentId ? { intentId: current.intentId } : {}),
+  }, storage, now);
+}
+
+export function clearResumableIntent(
+  storage: StorageLike | undefined = browserSessionStorage(),
+  now = Date.now(),
+): void {
+  const current = readResumableSession(storage, now);
+  if (!current?.intent) return;
+  writeResumableSession({
+    invitation: current.invitation,
+    role: current.role,
+    displayName: current.displayName,
+    ...(current.expectedPeerIdentity ? { expectedPeerIdentity: current.expectedPeerIdentity } : {}),
+    ...(current.sharePending !== undefined ? { sharePending: current.sharePending } : {}),
   }, storage, now);
 }
 
@@ -114,6 +134,23 @@ function parseResumableSession(value: unknown, now: number): ResumableSession | 
     }
   }
 
+  if (record.sharePending !== undefined && typeof record.sharePending !== "boolean") return null;
+  if (record.sharePending === true && record.role !== "creator") return null;
+  if (record.intent !== undefined && record.intent !== "remove-conversation") return null;
+
+  const hasIntentId = record.intentId !== undefined;
+  if (hasIntentId) {
+    if (record.intent !== "remove-conversation" || !isCanonicalUuid(record.intentId)) return null;
+  } else if (record.intent === "remove-conversation") {
+    return null;
+  }
+  if (
+    record.intent === "remove-conversation" &&
+    (record.role !== "creator" || typeof record.expectedPeerIdentity !== "string")
+  ) {
+    return null;
+  }
+
   return {
     format: 1,
     invitation,
@@ -122,8 +159,16 @@ function parseResumableSession(value: unknown, now: number): ResumableSession | 
     ...(typeof record.expectedPeerIdentity === "string"
       ? { expectedPeerIdentity: record.expectedPeerIdentity }
       : {}),
+    ...(typeof record.sharePending === "boolean" ? { sharePending: record.sharePending } : {}),
+    ...(record.intent === "remove-conversation" ? { intent: record.intent } : {}),
+    ...(typeof record.intentId === "string" ? { intentId: record.intentId } : {}),
     savedAt: record.savedAt,
   };
+}
+
+function isCanonicalUuid(value: unknown): value is string {
+  return typeof value === "string" &&
+    /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/u.test(value);
 }
 
 function browserSessionStorage(): StorageLike | undefined {
