@@ -566,6 +566,56 @@ describe("ICE recovery", () => {
     expect(internal.options.onState).toHaveBeenCalledWith("reconnecting");
   });
 
+  it("switches automatic recovery to the ECDH-negotiated private rendezvous", async () => {
+    vi.stubGlobal("window", { setTimeout, clearTimeout });
+    const connection = await createTestConnection("creator");
+    const setupPeerConnection = vi.fn();
+    const openSignalingSocket = vi.fn();
+    const resetPeerConnection = vi.fn();
+    const closeSignalingSocket = vi.fn();
+    const internal = connection as unknown as {
+      beginSessionReconnect: (trigger: string) => void;
+      reconnectCapability?: {
+        version: 1;
+        roomId: string;
+        secret: string;
+        creatorIdentity: string;
+        role: "creator";
+      };
+      options: {
+        roomId: string;
+        inviteSecret: Uint8Array<ArrayBuffer>;
+        role: "creator" | "joiner";
+        identity: { publicKeyRaw: string };
+        expectedCreatorIdentity?: string;
+      };
+    };
+    const capability = {
+      version: 1 as const,
+      roomId: base64UrlEncode(randomBytes(16)),
+      secret: base64UrlEncode(randomBytes(32)),
+      creatorIdentity: internal.options.identity.publicKeyRaw,
+      role: "creator" as const,
+    };
+    Object.assign(connection, {
+      secureNotified: true,
+      reconnectCapability: capability,
+      setupPeerConnection,
+      openSignalingSocket,
+      resetPeerConnection,
+      closeSignalingSocket,
+    });
+
+    internal.beginSessionReconnect("data-channel-close");
+
+    expect(internal.options.roomId).toBe(capability.roomId);
+    expect(base64UrlEncode(internal.options.inviteSecret)).toBe(capability.secret);
+    expect(internal.options.role).toBe("creator");
+    expect(internal.options.expectedCreatorIdentity).toBeUndefined();
+    expect(getDiagnosticEntries().find((entry) => entry.event === "session-reconnect-capability-activated")?.details)
+      .toBeUndefined();
+  });
+
   it("answers a post-secure restart offer even before its own disconnect event", async () => {
     vi.useFakeTimers();
     vi.stubGlobal("window", { setTimeout, clearTimeout });

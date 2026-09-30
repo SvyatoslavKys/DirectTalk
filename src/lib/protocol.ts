@@ -7,6 +7,11 @@ import {
   randomBytes,
   utf8,
 } from "./encoding";
+import {
+  RECONNECT_CAPABILITY_VERSION,
+  RECONNECT_PROTOCOL_FEATURE,
+  type ReconnectCapability,
+} from "./reconnect";
 
 export const PROTOCOL_VERSION = 1 as const;
 export type PeerRole = "creator" | "joiner";
@@ -26,6 +31,8 @@ export interface HelloMessage {
   ephemeralKey: string;
   nonce: string;
   name: string;
+  features?: string[];
+  featureSignature?: string;
   proof: string;
   signature: string;
 }
@@ -54,6 +61,7 @@ export interface DerivedSession {
   securityCode: string;
   peerId: string;
   peerFingerprint: string;
+  reconnectCapability?: ReconnectCapability;
 }
 
 interface SessionKeys {
@@ -104,16 +112,24 @@ export async function createLocalHandshake(
     name,
   };
   const signedPayload = serializeHelloFields(fields);
+  const features = [RECONNECT_PROTOCOL_FEATURE];
   const hmacKey = await importHmacKey(inviteSecret);
-  const [proof, signature] = await Promise.all([
+  const [proof, signature, featureSignature] = await Promise.all([
     crypto.subtle.sign("HMAC", hmacKey, signedPayload),
     crypto.subtle.sign({ name: "ECDSA", hash: "SHA-256" }, identity.privateKey, signedPayload),
+    crypto.subtle.sign(
+      { name: "ECDSA", hash: "SHA-256" },
+      identity.privateKey,
+      serializeHelloFeatures(fields, features),
+    ),
   ]);
 
   return {
     hello: {
       type: "hello",
       ...fields,
+      features,
+      featureSignature: base64UrlEncode(featureSignature),
       proof: base64UrlEncode(proof),
       signature: base64UrlEncode(signature),
     },
@@ -143,6 +159,10 @@ export async function verifyRemoteHello(
   const proof = decodeFixed(hello.proof, 32, "proof");
   const signature = base64UrlDecode(hello.signature);
   if (signature.byteLength < 64 || signature.byteLength > 80) throw new Error("Некорректная подпись handshake");
+  const featureSignature = hello.featureSignature ? base64UrlDecode(hello.featureSignature) : undefined;
+  if (featureSignature && (featureSignature.byteLength < 64 || featureSignature.byteLength > 80)) {
+    throw new Error("Некорректная подпись возможностей handshake");
+  }
 
   const [identityPublicKey, ephemeralPublicKey, hmacKey] = await Promise.all([
     crypto.subtle.importKey("raw", identityBytes, { name: "ECDSA", namedCurve: "P-256" }, true, ["verify"]),
@@ -150,12 +170,21 @@ export async function verifyRemoteHello(
     importHmacKey(inviteSecret),
   ]);
   const signedPayload = serializeHelloFields(hello);
-  const [validProof, validSignature] = await Promise.all([
+  const [validProof, validSignature, validFeatureSignature] = await Promise.all([
     crypto.subtle.verify("HMAC", hmacKey, proof, signedPayload),
     crypto.subtle.verify({ name: "ECDSA", hash: "SHA-256" }, identityPublicKey, signature, signedPayload),
+    featureSignature && hello.features
+      ? crypto.subtle.verify(
+          { name: "ECDSA", hash: "SHA-256" },
+          identityPublicKey,
+          featureSignature,
+          serializeHelloFeatures(hello, hello.features),
+        )
+      : Promise.resolve(true),
   ]);
   if (!validProof) throw new Error("Собеседник не владеет секретом приглашения");
   if (!validSignature) throw new Error("Подпись ключа устройства недействительна");
+  if (!validFeatureSignature) throw new Error("Подпись возможностей устройства недействительна");
 
   return { hello, identityPublicKey, ephemeralPublicKey };
 }
@@ -241,11 +270,25 @@ export async function deriveSession(
   );
   const keyMaterial = await crypto.subtle.importKey("raw", sharedSecret, "HKDF", false, ["deriveBits"]);
   const transcriptHash = await crypto.subtle.digest("SHA-256", transcript);
-  const expanded = await crypto.subtle.deriveBits(
-    { name: "HKDF", hash: "SHA-256", salt: inviteSecret, info: concatBytes(utf8("DirectTalk session v1"), transcriptHash) },
-    keyMaterial,
-    576,
-  );
+  const [expanded, reconnectExpanded] = await Promise.all([
+    crypto.subtle.deriveBits(
+      { name: "HKDF", hash: "SHA-256", salt: inviteSecret, info: concatBytes(utf8("DirectTalk session v1"), transcriptHash) },
+      keyMaterial,
+      576,
+    ),
+    supportsFeature(local.hello, RECONNECT_PROTOCOL_FEATURE) && supportsFeature(remote.hello, RECONNECT_PROTOCOL_FEATURE)
+      ? crypto.subtle.deriveBits(
+          {
+            name: "HKDF",
+            hash: "SHA-256",
+            salt: inviteSecret,
+            info: concatBytes(utf8("DirectTalk reconnect capability v1"), transcriptHash),
+          },
+          keyMaterial,
+          384,
+        )
+      : Promise.resolve(undefined),
+  ]);
   const bytes = new Uint8Array(expanded);
   const keys: SessionKeys = {
     creatorToJoinerKey: await importAesKey(bytes.slice(0, 32)),
@@ -256,11 +299,22 @@ export async function deriveSession(
 
   const sas = await crypto.subtle.sign("HMAC", await importHmacKey(inviteSecret), concatBytes(utf8("DirectTalk SAS v1"), transcriptHash));
   const peerDigest = await crypto.subtle.digest("SHA-256", base64UrlDecode(remote.hello.identityKey));
+  const reconnectBytes = reconnectExpanded ? new Uint8Array(reconnectExpanded) : undefined;
+  const reconnectCapability = reconnectBytes
+    ? {
+        version: RECONNECT_CAPABILITY_VERSION,
+        roomId: base64UrlEncode(reconnectBytes.slice(0, 16)),
+        secret: base64UrlEncode(reconnectBytes.slice(16, 48)),
+        creatorIdentity: creatorHello.identityKey,
+        role: localRole,
+      } satisfies ReconnectCapability
+    : undefined;
   return {
     cipher: new SessionCipher(local.hello.roomId, localRole, keys),
     securityCode: formatGroups(bytesToHex(sas).slice(0, 32), 4),
     peerId: base64UrlEncode(peerDigest),
     peerFingerprint: formatGroups(bytesToHex(peerDigest).slice(0, 32), 4),
+    ...(reconnectCapability ? { reconnectCapability } : {}),
   };
 }
 
@@ -355,6 +409,20 @@ function parseHello(value: unknown): HelloMessage {
   assertRoomId(hello.roomId);
   decodeFixed(hello.nonce, 16, "nonce");
   normalizeName(hello.name);
+  const hasFeatures = hello.features !== undefined;
+  const hasFeatureSignature = hello.featureSignature !== undefined;
+  if (hasFeatures !== hasFeatureSignature) throw new Error("Некорректные возможности handshake");
+  if (hasFeatures) {
+    if (
+      !Array.isArray(hello.features) ||
+      hello.features.length > 16 ||
+      hello.features.some((feature) => typeof feature !== "string" || !/^[a-z0-9][a-z0-9-]{0,63}$/u.test(feature)) ||
+      new Set(hello.features).size !== hello.features.length ||
+      typeof hello.featureSignature !== "string"
+    ) {
+      throw new Error("Некорректные возможности handshake");
+    }
+  }
   return hello as unknown as HelloMessage;
 }
 
@@ -371,6 +439,24 @@ function serializeHelloFields(fields: Pick<HelloMessage, "version" | "roomId" | 
       fields.name,
     ]),
   );
+}
+
+function serializeHelloFeatures(
+  fields: Pick<HelloMessage, "version" | "roomId" | "role" | "identityKey" | "ephemeralKey" | "nonce" | "name">,
+  features: readonly string[],
+): Uint8Array<ArrayBuffer> {
+  return utf8(
+    JSON.stringify([
+      "DirectTalk hello features",
+      PROTOCOL_VERSION,
+      base64UrlEncode(serializeHelloFields(fields)),
+      features,
+    ]),
+  );
+}
+
+function supportsFeature(hello: HelloMessage, feature: string): boolean {
+  return hello.features?.includes(feature) === true;
 }
 
 function serializeTranscript(creator: HelloMessage, joiner: HelloMessage): Uint8Array<ArrayBuffer> {

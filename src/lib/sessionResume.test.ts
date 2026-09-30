@@ -2,12 +2,14 @@ import { describe, expect, it } from "vitest";
 import { base64UrlEncode, randomBytes } from "./encoding";
 import { createInvitation } from "./invite";
 import { createIdentityKeys } from "./protocol";
+import { reconnectInvitation } from "./reconnect";
 import {
   clearResumableIntent,
   clearResumableSession,
   readResumableSession,
   RESUMABLE_SESSION_KEY,
   RESUMABLE_SESSION_MAX_AGE_MS,
+  updateResumableReconnectCapability,
   updateResumablePeerIdentity,
   writeResumableSession,
 } from "./sessionResume";
@@ -47,6 +49,35 @@ describe("reload session recovery", () => {
     expect(readResumableSession(storage, 2_001)?.expectedPeerIdentity).toBe(peerIdentity);
   });
 
+  it("replaces a one-time invitation with the negotiated stable reconnect capability", async () => {
+    const storage = memoryStorage();
+    const invitation = createInvitation(await createIdentityKeys());
+    const creatorIdentity = (await createIdentityKeys()).publicKeyRaw;
+    const peerIdentity = base64UrlEncode(randomBytes(65));
+    const reconnectCapability = {
+      version: 1 as const,
+      roomId: base64UrlEncode(randomBytes(16)),
+      secret: base64UrlEncode(randomBytes(32)),
+      creatorIdentity,
+      role: "joiner" as const,
+    };
+    writeResumableSession({ invitation, role: "creator", displayName: "Alice" }, storage, 1_000);
+
+    updateResumableReconnectCapability(reconnectCapability, peerIdentity, storage, 2_000);
+
+    expect(readResumableSession(storage, 2_001)).toMatchObject({
+      invitation: {
+        version: 1,
+        roomId: reconnectCapability.roomId,
+        secret: reconnectCapability.secret,
+        creatorIdentity,
+      },
+      role: "joiner",
+      expectedPeerIdentity: peerIdentity,
+      reconnectCapability,
+    });
+  });
+
   it("round-trips a saved-chat reconnect with its share and removal context", async () => {
     const storage = memoryStorage();
     const invitation = createInvitation(await createIdentityKeys());
@@ -67,6 +98,36 @@ describe("reload session recovery", () => {
       role: "creator",
       displayName: "Alice",
       sharePending: true,
+      intent: "remove-conversation",
+      intentId,
+    });
+  });
+
+  it("keeps a removal intent when the saved reconnect role is joiner", async () => {
+    const storage = memoryStorage();
+    const peerIdentity = base64UrlEncode(randomBytes(65));
+    const reconnectCapability = {
+      version: 1 as const,
+      roomId: base64UrlEncode(randomBytes(16)),
+      secret: base64UrlEncode(randomBytes(32)),
+      creatorIdentity: peerIdentity,
+      role: "joiner" as const,
+    };
+    const intentId = "12345678-1234-4abc-8def-1234567890ab";
+
+    writeResumableSession({
+      invitation: reconnectInvitation(reconnectCapability),
+      role: "joiner",
+      displayName: "Bob",
+      expectedPeerIdentity: peerIdentity,
+      reconnectCapability,
+      intent: "remove-conversation",
+      intentId,
+    }, storage, 1_000);
+
+    expect(readResumableSession(storage, 2_000)).toMatchObject({
+      role: "joiner",
+      reconnectCapability,
       intent: "remove-conversation",
       intentId,
     });
@@ -142,7 +203,6 @@ describe("reload session recovery", () => {
 
   it("rejects invalid sharing and intent combinations", async () => {
     const invitation = createInvitation(await createIdentityKeys());
-    const peerIdentity = base64UrlEncode(randomBytes(65));
     const invalidRecords = [
       { sharePending: "yes" },
       { role: "joiner", sharePending: true },
@@ -151,10 +211,13 @@ describe("reload session recovery", () => {
       { intent: "remove-conversation", intentId: "not-a-uuid" },
       { intent: "remove-conversation", intentId: "12345678-1234-4ABC-8DEF-1234567890AB" },
       {
-        role: "joiner",
-        expectedPeerIdentity: peerIdentity,
-        intent: "remove-conversation",
-        intentId: "12345678-1234-4abc-8def-1234567890ab",
+        reconnectCapability: {
+          version: 1,
+          roomId: invitation.roomId,
+          secret: invitation.secret,
+          creatorIdentity: invitation.creatorIdentity,
+          role: "creator",
+        },
       },
     ];
 

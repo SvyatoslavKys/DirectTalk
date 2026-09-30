@@ -23,6 +23,7 @@ DirectTalk cannot protect against:
 - a person who obtains the complete invitation link and impersonates the expected guest when the participants do not compare their safety code;
 - deletion or copying of a browser profile and its local history;
 - metadata analysis: signaling can observe IP addresses, connection times, the room ID, and ICE/SDP data; STUN, TURN, and the peer receive network metadata;
+- linkability of reconnects: a saved conversation reuses a private rendezvous room, so the signaling service can correlate those connection attempts even though it cannot read the capability secret or messages;
 - denial of service: signaling can refuse to connect the participants or interrupt channel establishment.
 
 ## Why WebRTC alone is not enough
@@ -37,13 +38,14 @@ PairDrop uses WebRTC and a server without a database, but the project [separatel
 2. The `roomId`, secret, and creator's public identity key are placed in the `#invite=...` fragment. URL fragments are not sent to the HTTP server. Before the guest connects, the application removes the fragment from the address bar.
 3. Each browser profile stores a long-lived ECDSA P-256 key pair in IndexedDB. The private `CryptoKey` is created as non-extractable.
 4. Each participant generates a fresh ECDH P-256 key pair and random nonce for every session.
-5. The handshake fields contain the protocol version, room, role, identity key, ephemeral key, nonce, and display name. They are signed with ECDSA and authenticated with HMAC-SHA-256 using the `inviteSecret`.
+5. The handshake fields contain the protocol version, room, role, identity key, ephemeral key, nonce, display name, and authenticated optional protocol features. They are signed with ECDSA and authenticated with HMAC-SHA-256 using the `inviteSecret`.
 6. Before transmission, the complete handshake is encrypted with a separate AES-256-GCM key derived from the `inviteSecret`, room, and role. As a result, a signaling server that actively splits WebRTC into two DTLS channels cannot learn the display name or identity key without the invitation secret.
 7. The guest additionally verifies that the creator's identity key matches the key embedded in the invitation.
 8. The shared ECDH secret is passed to HKDF-SHA-256. The `inviteSecret` is used as the salt, and the complete transcript hash is used as context. HKDF independently derives two AES-256-GCM keys and two directional nonce prefixes.
-9. The participants exchange an initial encrypted `session-ready` message. The chat becomes available only after bidirectional key confirmation.
-10. Every AES-GCM packet receives a 96-bit nonce: `direction-prefix || uint64 sequence`. The room, direction, and sequence number are included in the additional authenticated data. A skipped or repeated sequence number closes the connection.
-11. The safety code is derived from an HMAC of the invitation secret and complete handshake transcript. Participants compare this code over an independent channel. After the first authenticated session, both roles pin the remote identity for same-tab reload recovery; a different identity causes a hard security failure.
+9. When both peers advertise reconnect capability v1, the same ECDH material is passed through a separate domain-separated HKDF expansion to derive a random-looking 128-bit reconnect room and 256-bit reconnect secret. This capability is never placed in the invitation QR or sent to the server. Each browser stores its role and the creator identity with the capability.
+10. The participants exchange an initial encrypted `session-ready` message. The chat becomes available only after bidirectional key confirmation. The reconnect capability is persisted only after this authenticated session is ready.
+11. Every AES-GCM packet receives a 96-bit nonce: `direction-prefix || uint64 sequence`. The room, direction, and sequence number are included in the additional authenticated data. A skipped or repeated sequence number closes the connection.
+12. The safety code is derived from an HMAC of the invitation secret and complete handshake transcript. Participants compare this code over an independent channel. After the first authenticated session, both roles pin the remote identity; a different identity causes a hard security failure.
 
 This design uses fresh session keys but does not implement a Double Ratchet within a session. Offline delivery and post-compromise security should use a reviewed protocol implementation such as the [Signal Double Ratchet](https://signal.org/docs/specifications/doubleratchet/) instead of extending this design with an improvised ratchet. Signal also [requires authentication of identity keys](https://signal.org/docs/specifications/sesame/#authentication), for example by comparing a fingerprint or QR code.
 
@@ -57,6 +59,8 @@ The signaling server can see:
 - the room ID, participant roles, signaling time, and signaling volume;
 - the SDP and ICE candidates required by WebRTC;
 - disconnect events.
+
+For saved-chat reconnects, the signaling server can also recognize repeated use of the same reconnect room. The room is a rendezvous identifier, not an encryption key; the separately derived reconnect secret is used to protect and authenticate the new handshake. Every successful reconnect performs a fresh ephemeral ECDH exchange and derives fresh message keys.
 
 The DirectTalk signaling protocol does not provide the server with:
 
@@ -77,15 +81,17 @@ DirectTalk does not strip EXIF or other embedded metadata. Images are transferre
 
 Message text and sent or received images are currently stored as plaintext in IndexedDB. Meaningful encryption at rest requires a separate user secret or system key store; placing a key next to the ciphertext in the same browser profile does not honestly protect against a compromised origin. The interface can delete an individual message or clear the current chat. Complete removal of all data for the origin is still performed through the browser's site-data settings.
 
-For reload recovery, the current tab also keeps the invitation capability, participant role, display name, and pinned remote identity in `sessionStorage` for at most 12 hours. This record survives reload but is removed by an explicit exit and is normally scoped to that tab. It never stores the ephemeral ECDH private key, derived AES keys, or sequence counters: every recovered connection performs a new handshake and derives fresh keys and nonce prefixes. Anyone who can read the origin's browser storage or execute JavaScript in the origin can also read this recovery capability.
+For reload recovery, the current tab also keeps the active rendezvous capability, participant role, display name, and pinned remote identity in `sessionStorage` for at most 12 hours. This record survives reload but is removed by an explicit exit and is normally scoped to that tab. It never stores the ephemeral ECDH private key, message AES keys, or sequence counters: every recovered connection performs a new handshake and derives fresh keys and nonce prefixes.
+
+After two current clients complete their first authenticated session, the contact record in IndexedDB stores the separately derived reconnect capability. It is a bearer secret: anyone who can read the origin's browser storage or execute JavaScript in the origin can copy it or attempt to join its signaling room. Identity pinning and signed handshakes prevent a different device key from being accepted as the saved contact, but they do not prevent denial of service or metadata correlation. Deleting a saved conversation locally removes this capability while retaining the pinned public identity and verification state.
 
 ## Deletion semantics
 
 - Any message can be deleted from the user's own IndexedDB.
 - With “delete for both,” a participant can ask the peer to delete only a message that participant originally sent. The recipient checks the stored message direction and rejects attempts to delete the recipient's own messages.
 - Clearing both copies is never performed automatically by a remote command. The other participant sees a request and must explicitly accept it.
-- Removing a saved conversation locally deletes its messages and attachments but deliberately retains the contact's public identity and verification state. A future invitation to the same device can therefore be pinned to the previously authenticated key.
-- “Delete chat for both” is a live, consent-based request: DirectTalk creates a fresh one-time invitation pinned to the known device, reconnects, and asks the peer to remove its local copy. It is not an offline server command.
+- Removing a saved conversation locally deletes its messages, attachments, and reconnect capability but deliberately retains the contact's public identity and verification state. A future invitation to the same device can therefore be pinned to the previously authenticated key.
+- “Delete chat for both” is a live, consent-based request: DirectTalk reconnects through the saved capability (or, for a legacy contact, one final identity-pinned invitation) and asks the peer to remove its local copy. It is not an offline server command.
 - Deletion commands travel inside the end-to-end encrypted session and work only while both browsers are connected. The server does not queue deletion commands.
 - Deletion is best effort. A modified client can ignore a request, and DirectTalk cannot erase an exported file, backup, screenshot, or data stored in another browser profile.
 - Removing an IndexedDB record does not guarantee physical erasure of storage blocks. High-assurance environments should use full-disk encryption and delete the complete browser profile when necessary.

@@ -1,5 +1,6 @@
 import Dexie, { type EntityTable } from "dexie";
 import { createIdentityKeys, type IdentityKeys } from "./protocol";
+import type { ReconnectCapability } from "./reconnect";
 
 export type MessageStatus = "sending" | "delivered" | "read" | "failed";
 
@@ -38,12 +39,14 @@ export interface StoredAttachment {
 export interface StoredContact {
   id: string;
   name: string;
+  localName?: string;
   identityKey: string;
   fingerprint: string;
   verified: boolean;
   firstSeenAt: number;
   lastSeenAt: number;
   hiddenAt?: number;
+  reconnectCapability?: ReconnectCapability;
 }
 
 export interface StoredChatSummary {
@@ -174,6 +177,10 @@ export async function hideChatLocally(chatId: string, now = Date.now()): Promise
     const contact = await db.contacts.get(chatId);
     await db.attachments.where("chatId").equals(chatId).delete();
     await db.messages.where("chatId").equals(chatId).delete();
-    if (contact) await db.contacts.put({ ...contact, hiddenAt: now });
+    if (contact) {
+      const hiddenContact = { ...contact, hiddenAt: now };
+      delete hiddenContact.reconnectCapability;
+      await db.contacts.put(hiddenContact);
+    }
   });
 }

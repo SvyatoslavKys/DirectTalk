@@ -13,7 +13,7 @@ A minimal private chat between two browsers. The signaling server only relays SD
 - a persistent local device key and signed ephemeral session keys;
 - a safety code and persistent verified-contact status;
 - local chat history through Dexie/IndexedDB;
-- a local chat list with last-message previews, offline read-only history, and identity-pinned reconnection through a fresh one-time invitation;
+- a local chat list with last-message previews, offline read-only history, and identity-pinned reconnection without resharing a QR code;
 - `delivered` and `read` receipts;
 - direct transfer of JPEG, PNG, WebP, and GIF images up to 10 MB: the recipient approves the download, data is sent in encrypted chunks with backpressure, and the completed file is verified with SHA-256;
 - local deletion of any message and confirmed deletion of the user's own sent messages from both participants;
@@ -39,15 +39,19 @@ Vercel WebSocket Functions have a maximum lifetime. Before WebRTC is ready, the 
 
 ## Reload and reconnection model
 
-A browser reload always destroys its `RTCPeerConnection`; a live WebRTC connection cannot be serialized and resumed. DirectTalk therefore keeps a validated, 12-hour recovery record in that tab's `sessionStorage`. It contains the invitation capability, role, local display name, and—after the first successful handshake—the authenticated peer identity. It does not contain ephemeral ECDH keys, AES session keys, packet counters, messages, or files.
+A browser reload always destroys its `RTCPeerConnection`; a live WebRTC connection cannot be serialized and resumed. DirectTalk therefore keeps a validated, 12-hour recovery record in that tab's `sessionStorage`. It contains the active rendezvous capability, role, local display name, and—after the first successful handshake—the authenticated peer identity. It does not contain ephemeral ECDH keys, AES session keys, packet counters, messages, or files.
 
-After a reload, DirectTalk rejoins the signaling room, creates a new peer connection, performs a fresh ephemeral-key handshake, and refuses a different device identity. The other browser moves into a visible reconnecting state and temporarily disables sending, photo transfer, and remote deletion until the new secure channel is ready. Pending text packets are safely requeued with their existing UUIDs; the receiver deduplicates them. Interrupted photos are marked failed instead of being uploaded again without user intent. Choosing **Close**, **Home**, or **Cancel connection** explicitly deletes the recovery record.
+After a reload, DirectTalk rejoins the signaling room, creates a new peer connection, performs a fresh ephemeral-key handshake, and refuses a different device identity. The other browser moves into a visible reconnecting state and temporarily disables sending, photo transfer, and remote deletion until the new secure channel is ready. Pending text packets are safely requeued with their existing UUIDs; the receiver deduplicates them. Interrupted photos are marked failed instead of being uploaded again without user intent. Choosing **Close**, **Home**, or **Cancel connection** deletes the short-lived tab recovery record, but it does not remove a saved chat's separate reconnect capability.
 
 This is session recovery, not an account login. If both browsers are offline at different times, DirectTalk has no server inbox and cannot deliver messages later. A restrictive network still needs a working TURN route.
 
 Conversation history is matched to the remote browser profile's long-lived public identity key, not to its nickname or invitation link. A new invitation to the same browser profile therefore opens the same locally stored thread even if the nickname changed. A different browser profile, private-browsing session, device, or cleared site data creates a different identity and a separate thread. Each participant has an independent local copy; the server never reconstructs or synchronizes history.
 
-The chat list is also entirely local. Opening an old entry shows its saved history without claiming that the other device is online. **Reconnect** creates a new one-time invitation pinned to that contact's existing identity key; the link still has to be delivered through another channel. Deleting a chat locally removes its messages and photos but keeps the contact key and verification state so a later reconnection cannot silently replace the known device. **Request deletion from both** first reconnects the same authenticated device, then sends an end-to-end encrypted request. The peer must explicitly confirm. The server never queues this request; it is sent only after both devices establish a live secure session.
+The chat list is also entirely local. Opening an old entry shows its saved history without claiming that the other device is online. During the first authenticated session between two current clients, both browsers derive a separate reconnect capability from the ephemeral ECDH exchange. Its room and secret are stored only in those browser profiles and never appear in the QR code. Later, **Reconnect** uses that capability and the pinned device identity, so no new link is shown. Session encryption still uses fresh ephemeral keys every time.
+
+Both devices must nevertheless be live in the same saved conversation: one can already be waiting after a disconnect, or both users can press **Reconnect**. DirectTalk has no account-wide presence service, push notification, or offline inbox. Contacts created by versions that did not save a reconnect capability require one final identity-pinned invitation; after both current clients complete that session, future reconnects no longer need a QR code.
+
+Deleting a chat locally removes its messages, photos, and reconnect capability, but keeps the contact key and verification state so a later invitation cannot silently replace the known device. **Request deletion from both** first reconnects the same authenticated device, then sends an end-to-end encrypted request. The peer must explicitly confirm. The server never queues this request; it is sent only after both devices establish a live secure session.
 
 ## Deploy to Vercel
 

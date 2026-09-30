@@ -1,6 +1,11 @@
 import { base64UrlDecode } from "./encoding";
 import { parseInvitation, type Invitation } from "./invite";
 import type { PeerRole } from "./protocol";
+import {
+  parseReconnectCapability,
+  reconnectInvitation,
+  type ReconnectCapability,
+} from "./reconnect";
 
 interface StorageLike {
   getItem(key: string): string | null;
@@ -14,6 +19,7 @@ export interface ResumableSession {
   role: PeerRole;
   displayName: string;
   expectedPeerIdentity?: string;
+  reconnectCapability?: ReconnectCapability;
   sharePending?: boolean;
   intent?: "remove-conversation";
   intentId?: string;
@@ -71,6 +77,27 @@ export function updateResumablePeerIdentity(
     role: current.role,
     displayName: current.displayName,
     expectedPeerIdentity,
+    ...(current.reconnectCapability ? { reconnectCapability: current.reconnectCapability } : {}),
+    ...(current.intent ? { intent: current.intent } : {}),
+    ...(current.intentId ? { intentId: current.intentId } : {}),
+  }, storage, now);
+}
+
+export function updateResumableReconnectCapability(
+  capabilityValue: ReconnectCapability,
+  expectedPeerIdentity: string,
+  storage: StorageLike | undefined = browserSessionStorage(),
+  now = Date.now(),
+): void {
+  const current = readResumableSession(storage, now);
+  if (!current) return;
+  const capability = parseReconnectCapability(capabilityValue);
+  writeResumableSession({
+    invitation: reconnectInvitation(capability),
+    role: capability.role,
+    displayName: current.displayName,
+    expectedPeerIdentity,
+    reconnectCapability: capability,
     ...(current.intent ? { intent: current.intent } : {}),
     ...(current.intentId ? { intentId: current.intentId } : {}),
   }, storage, now);
@@ -87,6 +114,7 @@ export function clearResumableIntent(
     role: current.role,
     displayName: current.displayName,
     ...(current.expectedPeerIdentity ? { expectedPeerIdentity: current.expectedPeerIdentity } : {}),
+    ...(current.reconnectCapability ? { reconnectCapability: current.reconnectCapability } : {}),
     ...(current.sharePending !== undefined ? { sharePending: current.sharePending } : {}),
   }, storage, now);
 }
@@ -134,6 +162,26 @@ function parseResumableSession(value: unknown, now: number): ResumableSession | 
     }
   }
 
+  let reconnectCapability: ReconnectCapability | undefined;
+  if (record.reconnectCapability !== undefined) {
+    try {
+      reconnectCapability = parseReconnectCapability(record.reconnectCapability);
+    } catch {
+      return null;
+    }
+    const reconnectInvite = reconnectInvitation(reconnectCapability);
+    if (
+      record.role !== reconnectCapability.role ||
+      invitation.version !== reconnectInvite.version ||
+      invitation.roomId !== reconnectInvite.roomId ||
+      invitation.secret !== reconnectInvite.secret ||
+      invitation.creatorIdentity !== reconnectInvite.creatorIdentity ||
+      typeof record.expectedPeerIdentity !== "string"
+    ) {
+      return null;
+    }
+  }
+
   if (record.sharePending !== undefined && typeof record.sharePending !== "boolean") return null;
   if (record.sharePending === true && record.role !== "creator") return null;
   if (record.intent !== undefined && record.intent !== "remove-conversation") return null;
@@ -146,7 +194,7 @@ function parseResumableSession(value: unknown, now: number): ResumableSession | 
   }
   if (
     record.intent === "remove-conversation" &&
-    (record.role !== "creator" || typeof record.expectedPeerIdentity !== "string")
+    typeof record.expectedPeerIdentity !== "string"
   ) {
     return null;
   }
@@ -159,6 +207,7 @@ function parseResumableSession(value: unknown, now: number): ResumableSession | 
     ...(typeof record.expectedPeerIdentity === "string"
       ? { expectedPeerIdentity: record.expectedPeerIdentity }
       : {}),
+    ...(reconnectCapability ? { reconnectCapability } : {}),
     ...(typeof record.sharePending === "boolean" ? { sharePending: record.sharePending } : {}),
     ...(record.intent === "remove-conversation" ? { intent: record.intent } : {}),
     ...(typeof record.intentId === "string" ? { intentId: record.intentId } : {}),

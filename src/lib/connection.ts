@@ -22,6 +22,11 @@ import {
   type PhotoMimeType,
 } from "./photos";
 import { logDiagnostic, safeErrorText } from "./diagnostics";
+import {
+  decodeReconnectSecret,
+  parseReconnectCapability,
+  type ReconnectCapability,
+} from "./reconnect";
 
 const SIGNALING_CLOSE_GRACE_MS = 2_000;
 const DISCONNECTED_GRACE_MS = 1_500;
@@ -75,6 +80,7 @@ export interface SecurePeer {
   identityKey: string;
   fingerprint: string;
   securityCode: string;
+  reconnectCapability?: ReconnectCapability;
 }
 
 interface ConnectionOptions {
@@ -85,6 +91,7 @@ interface ConnectionOptions {
   displayName: string;
   expectedCreatorIdentity?: string;
   expectedPeerIdentity?: string;
+  reconnectCapability?: ReconnectCapability;
   resume?: boolean;
   onState: (state: ConnectionState) => void;
   onSecure: (peer: SecurePeer) => void;
@@ -159,10 +166,25 @@ export class DirectTalkConnection {
   private sessionReconnectActive: boolean;
   private pinnedPeerIdentity?: string;
   private hasEstablishedSession = false;
+  private reconnectCapability?: ReconnectCapability;
 
   constructor(private readonly options: ConnectionOptions) {
     this.sessionReconnectActive = Boolean(options.resume);
     this.pinnedPeerIdentity = options.expectedPeerIdentity;
+    if (options.reconnectCapability) {
+      const capability = parseReconnectCapability(options.reconnectCapability);
+      if (
+        capability.roomId !== options.roomId ||
+        capability.secret !== base64UrlEncode(options.inviteSecret) ||
+        capability.role !== options.role ||
+        (capability.role === "creator"
+          ? capability.creatorIdentity !== options.identity.publicKeyRaw
+          : capability.creatorIdentity !== options.expectedCreatorIdentity)
+      ) {
+        throw new Error("Reconnect capability does not match the connection options");
+      }
+      this.reconnectCapability = capability;
+    }
   }
 
   connect(): void {
@@ -748,10 +770,14 @@ export class DirectTalkConnection {
         this.options.expectedCreatorIdentity,
         this.pinnedPeerIdentity,
       );
+      if (remote.hello.identityKey === this.options.identity.publicKeyRaw) {
+        throw new Error("Нельзя подключить устройство к его собственной идентичности");
+      }
       this.pinnedPeerIdentity ??= remote.hello.identityKey;
       this.remoteHello = remote.hello;
       this.trace("handshake-identity-verified");
       this.session = await deriveSession(local, remote, this.options.inviteSecret);
+      this.reconnectCapability ??= this.session.reconnectCapability;
       this.trace("handshake-session-derived");
       await this.sendSessionReady();
       return;
@@ -822,6 +848,7 @@ export class DirectTalkConnection {
       identityKey: this.remoteHello.identityKey,
       fingerprint: this.session.peerFingerprint,
       securityCode: this.session.securityCode,
+      ...(this.reconnectCapability ? { reconnectCapability: this.reconnectCapability } : {}),
     });
     this.maybeScheduleSignalingClose();
   }
@@ -1507,6 +1534,7 @@ export class DirectTalkConnection {
     this.recoveryTimer = undefined;
     this.reconnectTimer = undefined;
     this.pinnedPeerIdentity ??= this.remoteHello?.identityKey;
+    this.activateReconnectCapability();
     this.sessionReconnectActive = true;
     this.secureNotified = false;
     this.closeSignalingSocket("session-reconnect");
@@ -1518,6 +1546,22 @@ export class DirectTalkConnection {
     } catch (error) {
       this.fail(error, "session-reconnect-setup");
     }
+  }
+
+  private activateReconnectCapability(): void {
+    const capability = this.reconnectCapability;
+    if (!capability) return;
+    const alreadyActive =
+      this.options.roomId === capability.roomId &&
+      this.options.role === capability.role &&
+      base64UrlEncode(this.options.inviteSecret) === capability.secret;
+    this.options.roomId = capability.roomId;
+    this.options.inviteSecret = decodeReconnectSecret(capability);
+    this.options.role = capability.role;
+    this.options.expectedCreatorIdentity = capability.role === "joiner"
+      ? capability.creatorIdentity
+      : undefined;
+    if (!alreadyActive) this.trace("session-reconnect-capability-activated");
   }
 
   private sendSignal(payload: Record<string, unknown>): boolean {

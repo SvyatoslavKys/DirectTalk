@@ -31,6 +31,13 @@ describe("DirectTalk cryptographic handshake", () => {
 
     expect(creatorSession.securityCode).toBe(joinerSession.securityCode);
     expect(creatorSession.peerId).not.toBe(joinerSession.peerId);
+    expect(creatorSession.reconnectCapability).toEqual({
+      ...joinerSession.reconnectCapability,
+      role: "creator",
+    });
+    expect(joinerSession.reconnectCapability?.role).toBe("joiner");
+    expect(creatorSession.reconnectCapability?.creatorIdentity).toBe(creatorIdentity.publicKeyRaw);
+    expect(creatorSession.reconnectCapability?.secret).not.toBe(base64UrlEncode(secret));
 
     const creatorWire = await creatorSession.cipher.seal({ kind: "chat-message", text: "Привет" });
     await expect(joinerSession.cipher.open(JSON.parse(creatorWire))).resolves.toEqual({
@@ -108,6 +115,48 @@ describe("DirectTalk cryptographic handshake", () => {
     const tampered: HelloMessage = { ...local.hello, name: "Мэллори" };
 
     await expect(verifyRemoteHello(tampered, roomId, secret, "joiner", identity.publicKeyRaw)).rejects.toThrow();
+  });
+
+  it("authenticates reconnect feature negotiation and remains compatible with a legacy hello", async () => {
+    const roomId = base64UrlEncode(randomBytes(16));
+    const secret = randomBytes(32);
+    const [creatorIdentity, joinerIdentity] = await Promise.all([createIdentityKeys(), createIdentityKeys()]);
+    const [creatorLocal, joinerLocal] = await Promise.all([
+      createLocalHandshake(creatorIdentity, roomId, secret, "creator", "Alice"),
+      createLocalHandshake(joinerIdentity, roomId, secret, "joiner", "Bob"),
+    ]);
+    const legacyJoiner: HelloMessage = { ...joinerLocal.hello };
+    delete legacyJoiner.features;
+    delete legacyJoiner.featureSignature;
+
+    const [creatorView, joinerView] = await Promise.all([
+      verifyRemoteHello(legacyJoiner, roomId, secret, "creator"),
+      verifyRemoteHello(creatorLocal.hello, roomId, secret, "joiner", creatorIdentity.publicKeyRaw),
+    ]);
+    const [creatorSession, joinerSession] = await Promise.all([
+      deriveSession({ ...creatorLocal }, creatorView, secret),
+      deriveSession({ ...joinerLocal, hello: legacyJoiner }, joinerView, secret),
+    ]);
+
+    expect(creatorSession.reconnectCapability).toBeUndefined();
+    expect(joinerSession.reconnectCapability).toBeUndefined();
+    const wire = JSON.parse(await creatorSession.cipher.seal({ kind: "session-ready" }));
+    await expect(joinerSession.cipher.open(wire)).resolves.toEqual({ kind: "session-ready" });
+  });
+
+  it("rejects a reconnect feature added without a valid identity signature", async () => {
+    const roomId = base64UrlEncode(randomBytes(16));
+    const secret = randomBytes(32);
+    const identity = await createIdentityKeys();
+    const local = await createLocalHandshake(identity, roomId, secret, "creator", "Alice");
+    const tampered: HelloMessage = {
+      ...local.hello,
+      features: ["reconnect-capability-v1", "forged-feature"],
+    };
+
+    await expect(verifyRemoteHello(tampered, roomId, secret, "joiner", identity.publicKeyRaw)).rejects.toThrow(
+      "возможностей",
+    );
   });
 
   it("rejects replayed encrypted packets", async () => {
